@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-telegram-real"
+HOME_DIR="${SAFEPLANE_HOME:-$HOME/.safeplane}"
+EVENTS="$HOME_DIR/connectors/telegram/events.jsonl"
+
+for secret in telegram_bot_token telegram_allowed_user_ids openrouter_api_key; do
+  test -s "$HOME_DIR/secrets/$secret" || {
+    echo "Missing required secret file: $HOME_DIR/secrets/$secret" >&2
+    exit 1
+  }
+done
+
+mkdir -p "$(dirname "$EVENTS")"
+touch "$EVENTS"
+
+dump_diagnostics() {
+  echo >&2
+  echo "=== Telegram and harness container status ===" >&2
+  "$COMPOSE" ps telegram-connector harness model-gateway >&2 || true
+  echo >&2
+  echo "=== Recent Telegram connector events ===" >&2
+  tail -n 80 "$EVENTS" >&2 || true
+  echo >&2
+  echo "=== Recent Telegram connector logs ===" >&2
+  "$COMPOSE" logs --tail=160 telegram-connector >&2 || true
+  echo >&2
+  echo "=== Recent harness logs ===" >&2
+  "$COMPOSE" logs --tail=100 harness >&2 || true
+}
+
+wait_for_connector_ready() {
+  local baseline="$1"
+  python3 - "$EVENTS" "$baseline" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+path = pathlib.Path(sys.argv[1])
+baseline = int(sys.argv[2])
+deadline = time.monotonic() + 90
+bot = None
+connector = None
+last_polling_error = None
+while time.monotonic() < deadline:
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines()[baseline:]:
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    for row in rows:
+        event = row.get("event")
+        if event == "bot_authenticated":
+            bot = row.get("payload") or {}
+        elif event == "connector_started":
+            connector = row.get("payload") or {}
+        elif event == "polling_failed":
+            last_polling_error = row.get("error") or {}
+        elif event == "polling_ready":
+            payload = row.get("payload") or bot or {}
+            allowed_count = int((connector or {}).get("allowed_user_count") or 0)
+            if allowed_count < 1:
+                raise SystemExit(
+                    "Telegram polling is active, but no allowed user ids are configured"
+                )
+            username = payload.get("bot_username") or "unknown"
+            print(
+                f"Telegram polling is ready: @{username}; "
+                f"configured allowed users: {allowed_count}"
+            )
+            raise SystemExit(0)
+    time.sleep(1)
+message = "Telegram connector never reached polling_ready."
+if last_polling_error:
+    message += (
+        f" Last polling error: {last_polling_error.get('type')}: "
+        f"{last_polling_error.get('message')}"
+    )
+raise SystemExit(message)
+PY
+}
+
+wait_for_command_event() {
+  local baseline="$1"
+  local command="$2"
+  local success_event="$3"
+  python3 - "$EVENTS" "$baseline" "$command" "$success_event" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+path = pathlib.Path(sys.argv[1])
+baseline = int(sys.argv[2])
+command = sys.argv[3]
+success_event = sys.argv[4]
+deadline = time.monotonic() + 90
+while time.monotonic() < deadline:
+    for line in path.read_text(encoding="utf-8").splitlines()[baseline:]:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event = row.get("event")
+        payload = row.get("payload") or {}
+        error = row.get("error") or {}
+        if event == success_event:
+            print(f"Observed {command} and confirmed Telegram sent its response")
+            raise SystemExit(0)
+        if event == "message_rejected":
+            raise SystemExit(
+                "Telegram received the command but rejected the user: "
+                + str(payload.get("reason"))
+            )
+        if event == "update_handling_failed" and payload.get("command") == command:
+            raise SystemExit(
+                f"Telegram received {command} but processing failed: "
+                f"{error.get('type')}: {error.get('message')}"
+            )
+    time.sleep(1)
+raise SystemExit(f"No {command} command was observed by the Telegram connector")
+PY
+}
+
+wait_for_workflow_completion() {
+  local baseline="$1"
+  local command="$2"
+  local entrypoint="$3"
+  python3 - "$EVENTS" "$baseline" "$command" "$entrypoint" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+path = pathlib.Path(sys.argv[1])
+baseline = int(sys.argv[2])
+command = sys.argv[3]
+entrypoint = sys.argv[4]
+deadline = time.monotonic() + 900
+run_id = None
+while time.monotonic() < deadline:
+    for line in path.read_text(encoding="utf-8").splitlines()[baseline:]:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event = row.get("event")
+        payload = row.get("payload") or {}
+        error = row.get("error") or {}
+        if (
+            event == "workflow_started"
+            and payload.get("entrypoint") == entrypoint
+        ):
+            run_id = payload.get("run_id")
+        if (
+            event == "message_completed"
+            and payload.get("entrypoint") == entrypoint
+            and (run_id is None or payload.get("run_id") == run_id)
+        ):
+            print(
+                f"Observed {command}: {entrypoint} workflow completed "
+                f"as run {payload.get('run_id')}"
+            )
+            raise SystemExit(0)
+        if event == "message_rejected":
+            raise SystemExit(
+                "Telegram received the command but rejected the user: "
+                + str(payload.get("reason"))
+            )
+        if event == "update_handling_failed" and payload.get("command") == command:
+            raise SystemExit(
+                f"Telegram received {command} but processing failed: "
+                f"{error.get('type')}: {error.get('message')}"
+            )
+    time.sleep(1)
+raise SystemExit(f"No completed {entrypoint} workflow was observed for {command}")
+PY
+}
+
+echo "Starting the real Telegram, harness, and model path without developer services..."
+"$COMPOSE" up -d --build --remove-orphans \
+  model-gateway \
+  calendar-task-mcp \
+  notification-task-mcp \
+  scheduler \
+  harness
+
+wait_for_harness_registry() {
+  "$COMPOSE" exec -T harness python - <<'PY'
+import json
+import time
+import urllib.request
+
+health = "http://127.0.0.1:8080/health"
+for _ in range(120):
+    try:
+        with urllib.request.urlopen(health, timeout=3) as response:
+            assert response.status == 200
+        break
+    except Exception:
+        time.sleep(1)
+else:
+    raise SystemExit("Harness did not become healthy inside its container")
+
+with urllib.request.urlopen(
+    "http://127.0.0.1:8080/workflows?connector=telegram&exposed_only=true",
+    timeout=10,
+) as response:
+    payload = json.loads(response.read().decode("utf-8"))
+entrypoints = [item["entrypoint"] for item in payload["workflows"]]
+assert entrypoints == ["assistant", "chat", "develop"], payload
+assert payload["default_entrypoint"] == "assistant", payload
+print("Registry exposure is correct:", ", ".join(entrypoints))
+PY
+}
+
+if ! registry_result="$(wait_for_harness_registry 2>&1)"; then
+  echo "$registry_result" >&2
+  dump_diagnostics
+  exit 1
+fi
+echo "$registry_result"
+
+startup_baseline="$(wc -l < "$EVENTS" | tr -d ' ')"
+"$COMPOSE" up -d --build --no-deps --force-recreate telegram-connector
+
+if ! ready_result="$(wait_for_connector_ready "$startup_baseline" 2>&1)"; then
+  echo "$ready_result" >&2
+  dump_diagnostics
+  exit 1
+fi
+echo "$ready_result"
+
+help_baseline="$(wc -l < "$EVENTS" | tr -d ' ')"
+cat <<'TEXT'
+
+Send this model-free command to the configured Telegram bot:
+
+/help
+
+The bot must reply with the complete Safeplane command reference.
+TEXT
+read -r -p "Press Enter after the /help reply is visible in Telegram... "
+if ! result="$(wait_for_command_event "$help_baseline" "/help" "help_sent" 2>&1)"; then
+  echo "$result" >&2
+  dump_diagnostics
+  exit 1
+fi
+echo "$result"
+
+assistant_baseline="$(wc -l < "$EVENTS" | tr -d ' ')"
+cat <<'TEXT'
+
+Now send this direct workflow command:
+
+/assistant Reply with a short confirmation that the Telegram assistant works.
+
+Wait until the bot replies.
+TEXT
+read -r -p "Press Enter after the /assistant reply is visible in Telegram... "
+if ! result="$(wait_for_workflow_completion "$assistant_baseline" "/assistant" "assistant" 2>&1)"; then
+  echo "$result" >&2
+  dump_diagnostics
+  exit 1
+fi
+echo "$result"
+
+chat_baseline="$(wc -l < "$EVENTS" | tr -d ' ')"
+cat <<'TEXT'
+
+Finally send this direct workflow command:
+
+/chat Reply with a short confirmation that the Telegram chat workflow works.
+
+Wait until the bot replies.
+TEXT
+read -r -p "Press Enter after the /chat reply is visible in Telegram... "
+if ! result="$(wait_for_workflow_completion "$chat_baseline" "/chat" "chat" 2>&1)"; then
+  echo "$result" >&2
+  dump_diagnostics
+  exit 1
+fi
+echo "$result"
+
+echo "OK: real Telegram help, assistant, and chat commands completed without developer services"

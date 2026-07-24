@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+MODE="${1:-prepare}"
+CONFIRM="${SAFEPLANE_CONFIRM_REAL_EXTERNAL_REPOSITORY:-}"
+PROFILE="${SAFEPLANE_REAL_REPOSITORY_PROFILE:-}"
+EXPECTED_REPOSITORY="${SAFEPLANE_REAL_REPOSITORY_EXPECTED_REPOSITORY:-}"
+TASK="${SAFEPLANE_REAL_REPOSITORY_TASK:-}"
+RUN_ID="${SAFEPLANE_REAL_REPOSITORY_RUN_ID:-}"
+SAFEPLANE_HOME="${SAFEPLANE_HOME:-$HOME/.safeplane}"
+PORT="${SAFEPLANE_HARNESS_PORT:-8787}"
+RUN_TIMEOUT_SECONDS="${SAFEPLANE_REAL_REPOSITORY_RUN_TIMEOUT_SECONDS:-7200}"
+COMPOSE="tests/scripts/compose-safeplane-developer-github-real"
+TOKEN_FILE="${SAFEPLANE_GITHUB_TOKEN_FILE:-$HOME/.config/safeplane/secrets/github_token}"
+OPENROUTER_FILE="${SAFEPLANE_OPENROUTER_API_KEY_FILE:-${SAFEPLANE_SECRET_ROOT:-$HOME/.config/safeplane/secrets}/openrouter_api_key}"
+REAL_REPOSITORY_DIR="$SAFEPLANE_HOME/real_repository"
+RUN_ID_FILE="$REAL_REPOSITORY_DIR/external-repository-run-id"
+SOURCE_FINGERPRINT_FILE="$REAL_REPOSITORY_DIR/source-fingerprint.json"
+CASE_STUDY_OUTPUT="${SAFEPLANE_REAL_REPOSITORY_CASE_STUDY_OUTPUT:-docs/evidence/external-repository-case-study.md}"
+
+usage() {
+  cat >&2 <<'EOF'
+Guarded real external-repository acceptance.
+
+Run the workflow; an opt-in profile creates one draft PR automatically after checks and LGTM:
+  SAFEPLANE_CONFIRM_REAL_EXTERNAL_REPOSITORY=yes \
+  SAFEPLANE_REAL_REPOSITORY_PROFILE=<profile> \
+  SAFEPLANE_REAL_REPOSITORY_EXPECTED_REPOSITORY=OWNER/REPOSITORY \
+  SAFEPLANE_REAL_REPOSITORY_TASK='bounded real task' \
+    tests/scripts/validate-real-external-repository prepare
+
+After inspecting the automatically created draft PR, record the sanitized case study:
+  SAFEPLANE_CONFIRM_REAL_EXTERNAL_REPOSITORY=yes \
+  SAFEPLANE_REAL_REPOSITORY_PROFILE=<profile> \
+  SAFEPLANE_REAL_REPOSITORY_EXPECTED_REPOSITORY=OWNER/REPOSITORY \
+  SAFEPLANE_REAL_REPOSITORY_RUN_ID=run_... \
+  SAFEPLANE_REAL_REPOSITORY_SANITIZED_TASK_SUMMARY='...' \
+  SAFEPLANE_REAL_REPOSITORY_OPERATOR_FINDINGS='...' \
+  SAFEPLANE_REAL_REPOSITORY_DEFECTS_FOUND='...' \
+  SAFEPLANE_REAL_REPOSITORY_FIXES_MADE='...' \
+  SAFEPLANE_REAL_REPOSITORY_KNOWN_LIMITATIONS='...' \
+    tests/scripts/validate-real-external-repository record
+EOF
+}
+
+if [[ "$CONFIRM" != "yes" ]]; then
+  echo "This is a guarded manual real external-repository/OpenRouter/GitHub acceptance." >&2
+  echo "Set SAFEPLANE_CONFIRM_REAL_EXTERNAL_REPOSITORY=yes after reviewing the selected task." >&2
+  exit 2
+fi
+if [[ -z "$PROFILE" ]]; then
+  echo "SAFEPLANE_REAL_REPOSITORY_PROFILE is required." >&2
+  exit 2
+fi
+if [[ -z "$EXPECTED_REPOSITORY" ]]; then
+  echo "SAFEPLANE_REAL_REPOSITORY_EXPECTED_REPOSITORY is required (owner/repository)." >&2
+  exit 2
+fi
+if [[ ! -s "$TOKEN_FILE" ]]; then
+  echo "GitHub token file is missing or empty: $TOKEN_FILE" >&2
+  exit 2
+fi
+if [[ ! -s "$OPENROUTER_FILE" ]]; then
+  echo "OpenRouter key file is missing or empty: $OPENROUTER_FILE" >&2
+  exit 2
+fi
+if [[ ! "$RUN_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
+  || (( RUN_TIMEOUT_SECONDS < 60 || RUN_TIMEOUT_SECONDS > 86400 )); then
+  echo "SAFEPLANE_REAL_REPOSITORY_RUN_TIMEOUT_SECONDS must be between 60 and 86400." >&2
+  exit 2
+fi
+
+resolved_home="$(python3 - "$SAFEPLANE_HOME" <<'PY'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+resolved_token="$(python3 - "$TOKEN_FILE" <<'PY'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+case "$resolved_token" in
+  "$resolved_home"|"$resolved_home"/*)
+    echo "GitHub token file must remain outside SAFEPLANE_HOME: $resolved_token" >&2
+    exit 2
+    ;;
+esac
+
+mkdir -p "$REAL_REPOSITORY_DIR"
+export SAFEPLANE_GITHUB_TOKEN_FILE="$TOKEN_FILE"
+
+validate_profile() {
+  .venv/bin/python - "$SAFEPLANE_HOME/config/repositories.yaml" "$PROFILE" "$EXPECTED_REPOSITORY" <<'PY'
+from pathlib import Path
+import sys,yaml
+path=Path(sys.argv[1]); profile_id=sys.argv[2]; expected=sys.argv[3]
+if not path.is_file():
+    raise SystemExit(f"Repository profile file is missing: {path}")
+raw=yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+profile=(raw.get('repository_profiles') or {}).get(profile_id)
+if not isinstance(profile,dict):
+    raise SystemExit(f"Repository profile is missing: {profile_id}")
+assert profile.get('enabled') is True, profile
+assert profile.get('allowed_repository') == expected, profile
+assert profile.get('pull_request_repository') == expected, profile
+assert profile.get('remote_write_allowed') is True, profile
+assert profile.get('draft_pr_creation') == 'automatic', profile
+assert profile.get('credential_profile'), profile
+assert profile.get('ref'), profile
+print(f"External repository profile ready: {profile_id} -> {expected} base={profile['ref']}")
+PY
+}
+
+source_fingerprint() {
+  python3 - <<'PY'
+import hashlib,json,subprocess
+head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+diff=subprocess.check_output(['git','diff','--binary','HEAD'])
+print(json.dumps({'head':head,'tracked_diff_sha256':hashlib.sha256(diff).hexdigest()},sort_keys=True))
+PY
+}
+
+save_source_fingerprint() {
+  source_fingerprint > "$SOURCE_FINGERPRINT_FILE"
+}
+
+assert_source_unchanged() {
+  python3 - "$SOURCE_FINGERPRINT_FILE" "$(source_fingerprint)" <<'PY'
+import json,sys
+expected=json.loads(open(sys.argv[1],encoding='utf-8').read())
+actual=json.loads(sys.argv[2])
+assert actual == expected, (expected,actual)
+print('Safeplane source checkout remained unchanged by the external repository run')
+PY
+}
+
+start_stack() {
+  "$COMPOSE" up -d --build --remove-orphans
+  healthy=no
+  for _ in $(seq 1 120); do
+    if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+      healthy=yes
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$healthy" != "yes" ]]; then
+    "$COMPOSE" ps >&2 || true
+    "$COMPOSE" logs --tail=160 harness model-gateway >&2 || true
+    echo "Harness did not become healthy." >&2
+    exit 1
+  fi
+}
+
+fetch_run() {
+  local run_id="$1"
+  curl -fsS "http://127.0.0.1:${PORT}/runs/${run_id}"
+}
+
+wait_for_terminal_run() {
+  local run_id="$1"
+  local output_file="$2"
+  local deadline=$((SECONDS + RUN_TIMEOUT_SECONDS))
+  local last_state=""
+
+  while (( SECONDS < deadline )); do
+    if fetch_run "$run_id" > "$output_file.tmp" 2>/dev/null; then
+      mv "$output_file.tmp" "$output_file"
+      read -r status state < <(python3 - "$output_file" <<'PY_STATUS'
+import json,sys
+run=json.loads(open(sys.argv[1],encoding='utf-8').read())
+pipeline=run.get('developer_pipeline') or {}
+print(run.get('status') or '', pipeline.get('current_state') or '')
+PY_STATUS
+)
+      if [[ "$state" != "$last_state" ]]; then
+        echo "External repository run progress: run=$run_id status=$status state=${state:-unknown}"
+        last_state="$state"
+      fi
+      case "$status" in
+        completed|failed|cancelled)
+          return 0
+          ;;
+      esac
+    fi
+    sleep 2
+  done
+
+  rm -f "$output_file.tmp"
+  echo "External repository run did not reach a terminal state within ${RUN_TIMEOUT_SECONDS} seconds: $run_id" >&2
+  return 1
+}
+
+validate_real_run() {
+  local run_json="$1"
+  python3 - "$run_json" "$PROFILE" "$EXPECTED_REPOSITORY" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1]); profile=sys.argv[2]; expected=sys.argv[3]
+pipeline=run.get('developer_pipeline') or {}
+binding=pipeline.get('remote_approval_binding') or {}
+workspace=run.get('repository_workspace') or {}
+assert run.get('status') == 'completed', run
+assert run.get('repository_profile') == profile, run
+assert pipeline.get('current_state') in {'waiting_for_remote_approval','completed'}, run
+assert pipeline.get('check_summary',{}).get('status') == 'passed', run
+assert pipeline.get('review_verdict') == 'LGTM', run
+if pipeline.get('current_state') == 'completed':
+    remote=run.get('remote_write') or pipeline.get('remote_write') or {}
+    assert remote.get('draft') is True, remote
+    assert str(remote.get('pull_request_url') or '').startswith('https://github.com/'), remote
+    assert pipeline.get('remote_approval_possible') is False, run
+else:
+    assert pipeline.get('remote_approval_possible') is True, run
+assert binding.get('repository_name') == expected, binding
+assert workspace.get('target_commit'), workspace
+assert (workspace.get('external_source_commits') or {}).get('archdoc'), workspace
+if pipeline.get('current_state') != 'completed':
+    assert not (run.get('remote_write') or pipeline.get('remote_write')), run
+agents=pipeline.get('agent_runs') or []
+assert len(agents) == 7, agents
+assert len({item.get('model_profile') for item in agents}) >= 2, agents
+assert all(item.get('model_mode') == 'real' for item in agents), agents
+assert all(item.get('actual_provider') not in {None,'safeplane-fake'} for item in agents), agents
+assert all(isinstance(item.get('duration_ms'),int) and item['duration_ms'] >= 0 for item in agents), agents
+print(f"Real external-repository pipeline completed for PR inspection: run={run['run_id']}")
+print(f"base={workspace['target_commit']} archdoc={workspace['external_source_commits']['archdoc']}")
+for item in agents:
+    print(
+        f"  {item['stage_id']}: {item['configured_model']} -> "
+        f"{item['actual_provider']} / {item['actual_model']} "
+        f"retries={item['retry_count']} duration_ms={item['duration_ms']} "
+        f"tokens={item.get('total_tokens')} cost={item.get('cost')}"
+    )
+PY
+}
+
+scan_credential_absence() {
+  python3 - "$TOKEN_FILE" "$SAFEPLANE_HOME" "$RUN_ID" <<'PY'
+from pathlib import Path
+import json,sys
+secret=Path(sys.argv[1]).read_bytes().strip()
+home=Path(sys.argv[2]); run_id=sys.argv[3]
+run_path=home/'runs'/f'{run_id}.json'
+run=json.loads(run_path.read_text(encoding='utf-8'))
+paths=[run_path, home/'workspaces'/run_id/'pipeline', home/'workspaces'/run_id/'evidence', home/'workspaces'/run_id/'remote-approvals']
+trace=Path(str(run.get('trace_path') or ''))
+if trace.is_absolute(): paths.append(trace)
+repo_config=home/'workspaces'/run_id/'repo'/'.git'/'config'
+if repo_config.is_file(): paths.append(repo_config)
+for root in paths:
+    candidates=[root] if root.is_file() else (list(root.rglob('*')) if root.exists() else [])
+    for path in candidates:
+        if not path.is_file() or path.is_symlink(): continue
+        try: data=path.read_bytes()
+        except OSError: continue
+        if secret and secret in data:
+            raise SystemExit(f'GitHub credential leaked into runtime evidence: {path}')
+print('GitHub credential is absent from external-repository run records, traces, evidence, approval artifacts, and Git config')
+PY
+}
+
+case "$MODE" in
+  prepare)
+    if [[ -z "$TASK" ]]; then
+      echo "SAFEPLANE_REAL_REPOSITORY_TASK is required for prepare mode." >&2
+      exit 2
+    fi
+    validate_profile
+    save_source_fingerprint
+    start_stack
+    response_file="$(mktemp)"
+    payload="$(python3 - "$TASK" "$PROFILE" <<'PY'
+import json,sys
+print(json.dumps({'connector':'cli','message':sys.argv[1],'repository_profile':sys.argv[2]}))
+PY
+)"
+    status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+      -X POST "http://127.0.0.1:${PORT}/connector/develop/start" \
+      -H 'Content-Type: application/json' -d "$payload")"
+    body="$(cat "$response_file")"; rm -f "$response_file"
+    if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+      printf '%s\n' "$body" >&2
+      "$COMPOSE" logs --tail=160 harness model-gateway >&2 || true
+      exit 1
+    fi
+    RUN_ID="$(python3 - "$body" <<'PY'
+import json,sys
+row=json.loads(sys.argv[1]); assert row.get('status') == 'queued', row
+print(row['run_id'])
+PY
+)"
+    printf '%s\n' "$RUN_ID" > "$RUN_ID_FILE"
+    echo "External repository run started asynchronously: run=$RUN_ID timeout=${RUN_TIMEOUT_SECONDS}s"
+    run_file="$(mktemp)"
+    if ! wait_for_terminal_run "$RUN_ID" "$run_file"; then
+      "$COMPOSE" logs --tail=160 harness model-gateway >&2 || true
+      rm -f "$run_file"
+      exit 1
+    fi
+    run_json="$(cat "$run_file")"
+    rm -f "$run_file"
+    run_status="$(python3 - "$run_json" <<'PY'
+import json,sys
+print(json.loads(sys.argv[1]).get('status') or '')
+PY
+)"
+    if [[ "$run_status" != "completed" ]]; then
+      python3 - "$run_json" <<'PY' >&2
+import json,sys
+run=json.loads(sys.argv[1]); error=run.get('error') or {}
+print(f"External repository run failed: {run.get('run_id')}: {error.get('message') or error}")
+PY
+      "$COMPOSE" logs --tail=160 harness model-gateway >&2 || true
+      exit 1
+    fi
+    validate_real_run "$run_json"
+    state="$(python3 - "$run_json" <<'PY_AUTOMATIC_STATE'
+import json,sys
+run=json.loads(sys.argv[1]); print((run.get('developer_pipeline') or {}).get('current_state') or '')
+PY_AUTOMATIC_STATE
+)"
+    if [[ "$state" != "completed" ]]; then
+      echo "Automatic draft-PR creation did not complete; inspect the run and retry manually with ./scripts/safeplane approve-pr $RUN_ID" >&2
+      exit 1
+    fi
+    assert_source_unchanged
+    echo
+    echo "Inspect the generated draft PR and collect evidence:"
+    echo "  ./scripts/safeplane status $RUN_ID"
+    echo "  ./scripts/safeplane evidence $RUN_ID"
+    echo "  export SAFEPLANE_REAL_REPOSITORY_RUN_ID='$RUN_ID'"
+    ;;
+
+  approve|record)
+    if [[ -z "$RUN_ID" && -s "$RUN_ID_FILE" ]]; then
+      RUN_ID="$(cat "$RUN_ID_FILE")"
+    fi
+    if [[ -z "$RUN_ID" ]]; then
+      echo "SAFEPLANE_REAL_REPOSITORY_RUN_ID is required for approve mode." >&2
+      exit 2
+    fi
+    for name in \
+      SAFEPLANE_REAL_REPOSITORY_SANITIZED_TASK_SUMMARY \
+      SAFEPLANE_REAL_REPOSITORY_OPERATOR_FINDINGS \
+      SAFEPLANE_REAL_REPOSITORY_DEFECTS_FOUND \
+      SAFEPLANE_REAL_REPOSITORY_FIXES_MADE \
+      SAFEPLANE_REAL_REPOSITORY_KNOWN_LIMITATIONS; do
+      if [[ -z "${!name:-}" ]]; then
+        echo "$name is required for approve mode." >&2
+        exit 2
+      fi
+    done
+    validate_profile
+    start_stack
+    run_json="$(fetch_run "$RUN_ID")"
+    state="$(python3 - "$run_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1]); print((run.get('developer_pipeline') or {}).get('current_state') or '')
+PY
+)"
+    if [[ "$state" == "waiting_for_remote_approval" ]]; then
+      validate_real_run "$run_json"
+    elif [[ "$state" != "completed" ]]; then
+      echo "Run is not approvable or completed: $state" >&2
+      exit 1
+    fi
+    assert_source_unchanged
+
+    if [[ "$state" == "waiting_for_remote_approval" ]]; then
+      response_file="$(mktemp)"
+      status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+        -X POST "http://127.0.0.1:${PORT}/runs/${RUN_ID}/remote/approve" \
+        -H 'Content-Type: application/json' \
+        -d '{"approved":true,"connector":"cli"}')"
+      body="$(cat "$response_file")"; rm -f "$response_file"
+      if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+        printf '%s\n' "$body" >&2
+        exit 1
+      fi
+    else
+      body="$(python3 - "$run_json" <<'PY_EXISTING'
+import json,sys
+run=json.loads(sys.argv[1]); print(json.dumps(run.get('remote_write') or {}))
+PY_EXISTING
+)"
+    fi
+    python3 - "$body" <<'PY'
+import json,sys
+row=json.loads(sys.argv[1])
+assert row.get('status') == 'completed', row
+assert row.get('draft') is True, row
+assert str(row.get('pull_request_url') or '').startswith('https://github.com/'), row
+print(f"External repository draft PR ready for operator inspection: {row['pull_request_url']}")
+print(f"Branch: {row['branch_name']}")
+print('Safeplane did not merge the pull request.')
+PY
+    assert_source_unchanged
+    scan_credential_absence
+
+    ./scripts/safeplane case-study "$RUN_ID" \
+      --output "$CASE_STUDY_OUTPUT" \
+      --expected-profile "$PROFILE" \
+      --task-summary "$SAFEPLANE_REAL_REPOSITORY_SANITIZED_TASK_SUMMARY" \
+      --operator-findings "$SAFEPLANE_REAL_REPOSITORY_OPERATOR_FINDINGS" \
+      --defects-found "$SAFEPLANE_REAL_REPOSITORY_DEFECTS_FOUND" \
+      --fixes-made "$SAFEPLANE_REAL_REPOSITORY_FIXES_MADE" \
+      --known-limitations "$SAFEPLANE_REAL_REPOSITORY_KNOWN_LIMITATIONS" \
+      --telegram-proof "${SAFEPLANE_REAL_REPOSITORY_TELEGRAM_PROOF:-Not included in this CLI run; validate separately through Telegram.}"
+    echo "Real external-repository evidence recorded; the draft PR remains for human review and merge control."
+    ;;
+
+  *)
+    usage
+    exit 2
+    ;;
+esac

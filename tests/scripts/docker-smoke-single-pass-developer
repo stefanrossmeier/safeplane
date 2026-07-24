@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-fake"
+PROJECT="${SAFEPLANE_DEVELOPER_WORKFLOW_PROJECT:-safeplane-developer-workflow-smoke}"
+PORT="${SAFEPLANE_DEVELOPER_WORKFLOW_PORT:-8800}"
+if [[ -n "${SAFEPLANE_DEVELOPER_WORKFLOW_HOME:-}" ]]; then
+  HOME_DIR="$SAFEPLANE_DEVELOPER_WORKFLOW_HOME"
+  HOME_CREATED=no
+else
+  HOME_DIR="$(mktemp -d)"
+  HOME_CREATED=yes
+fi
+KEEP="${SAFEPLANE_DEVELOPER_WORKFLOW_KEEP:-no}"
+
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export SAFEPLANE_HOME="$HOME_DIR"
+export SAFEPLANE_HARNESS_PORT="$PORT"
+export SAFEPLANE_DEV_SOURCE="$ROOT/tests/fixtures/developer-repo"
+export SAFEPLANE_REPOSITORY_CONFIG="/data/safeplane/config/repositories.yaml"
+export SAFEPLANE_ALLOW_LOCAL_GIT_FIXTURES=yes
+
+mkdir -p "$SAFEPLANE_HOME/workspaces" "$SAFEPLANE_HOME/config" "$SAFEPLANE_HOME/git-fixtures"
+chmod 0755 "$SAFEPLANE_HOME/workspaces"
+
+cleanup() {
+  if [[ "$KEEP" != "yes" ]]; then
+    cleanup_image="$("$COMPOSE" images -q harness 2>/dev/null | head -n 1 || true)"
+    "$COMPOSE" down --remove-orphans --volumes >/dev/null 2>&1 || true
+    if [[ "$HOME_CREATED" == "yes" ]]; then
+      "$ROOT/tests/scripts/remove-container-owned-tree" "$HOME_DIR" "$cleanup_image"
+    fi
+  else
+    echo "Keeping single-pass developer workflow smoke runtime: project=$PROJECT SAFEPLANE_HOME=$HOME_DIR"
+  fi
+}
+trap cleanup EXIT
+
+create_target_repo() {
+  local name="$1"
+  local check_mode="$2"
+  local work="$SAFEPLANE_HOME/git-fixtures/${name}-work"
+  local bare="$SAFEPLANE_HOME/git-fixtures/${name}.git"
+  rm -rf "$work" "$bare"
+  mkdir -p "$work/src" "$work/checks"
+  git -C "$work" init -q -b main
+  git -C "$work" config user.name "Safeplane fixture"
+  git -C "$work" config user.email "fixture@example.invalid"
+  printf '%s\n' "# single-pass developer workflow ${name} fixture" > "$work/README.md"
+  cat > "$work/src/greeter.py" <<'PY'
+def greet(name: str) -> str:
+    return f"Hello, {name}!"
+PY
+  if [[ "$check_mode" == "pass" ]]; then
+    cat > "$work/checks/check_greeting.py" <<'PY'
+from pathlib import Path
+content = Path("src/greeter.py").read_text(encoding="utf-8")
+assert "Hello from the developer pipeline" in content, content
+print("controlled greeting check passed")
+PY
+  else
+    cat > "$work/checks/check_greeting.py" <<'PY'
+import sys
+print("intentional controlled check failure", file=sys.stderr)
+sys.exit(7)
+PY
+  fi
+  git -C "$work" add .
+  git -C "$work" commit -qm "fixture"
+  git clone -q --bare "$work" "$bare"
+  git -C "$work" rev-parse HEAD
+}
+
+create_skill_repo() {
+  local work="$SAFEPLANE_HOME/git-fixtures/skills-work"
+  local bare="$SAFEPLANE_HOME/git-fixtures/skills.git"
+  rm -rf "$work" "$bare"
+  mkdir -p "$work/skills/archdoc/templates"
+  git -C "$work" init -q -b main
+  git -C "$work" config user.name "Safeplane fixture"
+  git -C "$work" config user.email "fixture@example.invalid"
+  cat > "$work/skills/archdoc/SKILL.md" <<'EOF_SKILL'
+# External archdoc fixture
+
+Create evidence-based repository documentation and preserve exact source provenance.
+EOF_SKILL
+  printf '%s\n' '# Repository map template' > "$work/skills/archdoc/templates/REPO_MAP.template.md"
+  git -C "$work" add .
+  git -C "$work" commit -qm "archdoc fixture"
+  git clone -q --bare "$work" "$bare"
+  git -C "$work" rev-parse HEAD
+}
+
+pass_commit="$(create_target_repo target-pass pass)"
+fail_commit="$(create_target_repo target-fail fail)"
+skill_commit="$(create_skill_repo)"
+export SAFEPLANE_ARCHDOC_REPOSITORY_URL="file:///data/safeplane/git-fixtures/skills.git"
+
+cat > "$SAFEPLANE_HOME/config/repositories.yaml" <<'YAML'
+version: 1
+credential_profiles: {}
+repository_profiles:
+  developer_workflow-pass:
+    enabled: true
+    repository_url: file:///data/safeplane/git-fixtures/target-pass.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: null
+    allow_file_url: true
+    remote_write_allowed: false
+    branch_prefix: safeplane/
+  developer_workflow-fail:
+    enabled: true
+    repository_url: file:///data/safeplane/git-fixtures/target-fail.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: null
+    allow_file_url: true
+    remote_write_allowed: false
+    branch_prefix: safeplane/
+YAML
+
+wait_health() {
+  local deadline=$((SECONDS + 120))
+  until curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      "$COMPOSE" ps >&2 || true
+      "$COMPOSE" logs harness dev-workspace-mcp dev-workspace-apply-mcp dev-check-mcp >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+echo "Starting isolated single-pass developer workflow single-pass developer stack..."
+"$COMPOSE" up -d --build
+wait_health
+
+post_run() {
+  local profile="$1"
+  local message="$2"
+  local response_file status payload
+  response_file="$(mktemp)"
+  payload="$(python3 - "$profile" "$message" <<'PY'
+import json, sys
+print(json.dumps({"connector":"cli", "repository_profile":sys.argv[1], "message":sys.argv[2]}))
+PY
+)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:${PORT}/connector/develop" \
+    -H 'Content-Type: application/json' -d "$payload")"
+  printf '%s\n' "$status"
+  cat "$response_file"
+  rm -f "$response_file"
+}
+
+start_run() {
+  local profile="$1"
+  local message="$2"
+  local response_file status payload body
+  response_file="$(mktemp)"
+  payload="$(python3 - "$profile" "$message" <<'PY'
+import json, sys
+print(json.dumps({"connector":"cli", "repository_profile":sys.argv[1], "message":sys.argv[2]}))
+PY
+)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:${PORT}/connector/develop/start" \
+    -H 'Content-Type: application/json' -d "$payload")"
+  body="$(cat "$response_file")"
+  rm -f "$response_file"
+  [[ "$status" =~ ^2[0-9][0-9]$ ]] || { printf '%s\n' "$body" >&2; return 1; }
+  python3 - "$body" <<'PY'
+import json,sys
+row=json.loads(sys.argv[1]); assert row.get("status")=="queued", row
+print(row["run_id"])
+PY
+}
+
+wait_run() {
+  local run_id="$1"
+  local deadline=$((SECONDS + 120))
+  local response_file http_status body status
+  response_file="$(mktemp)"
+
+  while (( SECONDS < deadline )); do
+    if ! http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+      "http://127.0.0.1:${PORT}/runs/${run_id}")"; then
+      echo "Run-status poll transport failed: run=$run_id" >&2
+      rm -f "$response_file"
+      return 1
+    fi
+
+    body="$(cat "$response_file")"
+    if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+      echo "Run-status poll returned HTTP $http_status: run=$run_id" >&2
+      printf '%s\n' "$body" >&2
+      rm -f "$response_file"
+      return 1
+    fi
+
+    if ! status="$(python3 - "$body" <<'PY'
+import json,sys
+print(json.loads(sys.argv[1]).get("status") or "")
+PY
+)"; then
+      echo "Run-status poll returned invalid JSON: run=$run_id" >&2
+      printf '%s\n' "$body" >&2
+      rm -f "$response_file"
+      return 1
+    fi
+
+    case "$status" in
+      completed|failed|cancelled)
+        rm -f "$response_file"
+        printf '%s\n' "$body"
+        return 0
+        ;;
+    esac
+    sleep 1
+  done
+
+  rm -f "$response_file"
+  echo "Timed out waiting for asynchronous developer run: $run_id" >&2
+  return 1
+}
+
+response="$(post_run developer_workflow-pass 'Adjust the fixture greeting')"
+http_status="$(printf '%s\n' "$response" | head -1)"
+body="$(printf '%s\n' "$response" | tail -n +2)"
+[[ "$http_status" =~ ^2[0-9][0-9]$ ]] || { printf '%s\n' "$body" >&2; exit 1; }
+run_lgtm="$(python3 - "$body" <<'PY'
+import json, sys
+row=json.loads(sys.argv[1]); assert row["status"]=="completed", row; print(row["run_id"])
+PY
+)"
+
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_lgtm" "$pass_commit" "$skill_commit" <<'PY'
+import json, pathlib, sys
+home=pathlib.Path(sys.argv[1]); run_id,target_commit,skill_commit=sys.argv[2:]
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+state=json.loads((pipe/"pipeline.json").read_text())
+context=json.loads((pipe/"repository-context.json").read_text())
+apply=json.loads((pipe/"implementation-apply.json").read_text())
+checks=json.loads((pipe/"checks.json").read_text())
+baseline=json.loads((pipe/"baseline_documentation.json").read_text())
+final=json.loads((pipe/"final_documentation.json").read_text())
+review=json.loads((pipe/"review.json").read_text())
+pr=json.loads((pipe/"pr.json").read_text())
+assert run["status"]=="completed", run
+assert state["current_state"]=="waiting_for_remote_approval", state
+assert state["completed_stages"]==["repositories","baseline_documentation","analysis","planning","implementation","checks","final_documentation","review","pr","remote_approval"], state
+assert context["base_commit"]==target_commit and context["external_skill_commit"]==skill_commit, context
+assert baseline["skill_source_commit"]==skill_commit==final["skill_source_commit"]
+assert apply["authorization_source"]=="developer_pipeline_plan", apply
+assert apply["plan_budget_result"]["status"]=="passed", apply
+assert {item["path"] for item in apply["changed_files"]}=={"src/greeter.py"}, apply
+assert checks["mode"]=="controlled" and checks["status"]=="passed", checks
+assert checks["command_results"][0]["network_policy"]=="disabled", checks
+assert checks["command_results"][0]["stdout_ref"], checks
+assert review["verdict"]=="LGTM", review
+assert review["plan_alignment"]=="ALIGNED", review
+assert pr["draft"] is True, pr
+assert run["developer_pipeline"]["remote_approval_possible"] is False, run
+assert run["developer_pipeline"]["check_summary"]["status"]=="passed", run
+assert run["developer_pipeline"]["review_verdict"]=="LGTM", run
+assert run["developer_pipeline"]["review_plan_alignment"]=="ALIGNED", run
+content=(root/"repo/src/greeter.py").read_text()
+assert "Hello from the developer pipeline" in content, content
+assert len(state["agent_runs"])==7, state
+assert len({item["model_profile"] for item in state["agent_runs"]})==6, state
+PY
+echo "LGTM path reached waiting_for_remote_approval: run=$run_lgtm"
+
+response="$(post_run developer_workflow-pass '[safeplane-fake-scenario:review_changes_requested] Adjust the fixture greeting')"
+http_status="$(printf '%s\n' "$response" | head -1)"; body="$(printf '%s\n' "$response" | tail -n +2)"
+[[ "$http_status" =~ ^2[0-9][0-9]$ ]] || { printf '%s\n' "$body" >&2; exit 1; }
+run_changes="$(python3 - "$body" <<'PY'
+import json, sys
+row=json.loads(sys.argv[1]); print(row["run_id"])
+PY
+)"
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_changes" <<'PY'
+import json, pathlib, sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]; pipe=home/"workspaces"/run_id/"pipeline"
+state=json.loads((pipe/"pipeline.json").read_text())
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+review=json.loads((pipe/"review.json").read_text())
+assert run["status"]=="completed", run
+assert state["current_state"]=="review_changes_requested", state
+assert state["completed_stages"][-1]=="review", state
+assert review["verdict"]=="REQUEST_CHANGES", review
+assert review["plan_alignment"]=="DEVIATION", review
+assert not (pipe/"pr.json").exists()
+assert run["developer_pipeline"]["remote_approval_possible"] is False
+assert run["developer_pipeline"]["review_plan_alignment"]=="DEVIATION", run
+PY
+echo "Plan-deviating review stopped without PR or rework: run=$run_changes"
+
+response="$(post_run developer_workflow-fail 'Adjust the fixture greeting')"
+http_status="$(printf '%s\n' "$response" | head -1)"; body="$(printf '%s\n' "$response" | tail -n +2)"
+[[ "$http_status" == "500" ]] || { echo "Expected HTTP 500, got $http_status" >&2; printf '%s\n' "$body" >&2; exit 1; }
+run_failed="$("$COMPOSE" exec -T harness python3 - <<'PY'
+import json
+from pathlib import Path
+runs=[json.loads(path.read_text()) for path in Path('/data/safeplane/runs').glob('run_*.json')]
+rows=[row for row in runs if row.get('repository_profile')=='developer_workflow-fail']
+print(max(rows, key=lambda row: row['created_at'])['run_id'])
+PY
+)"
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_failed" <<'PY'
+import json, pathlib, sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+state=json.loads((pipe/"pipeline.json").read_text())
+assert run["status"]=="failed", run
+assert state["current_state"]=="plan_ready", state
+assert state["completed_stages"]==["repositories","baseline_documentation","analysis","planning"], state
+error_text=str(run.get("error") or "")
+assert "stage implementation produced no valid output" in error_text, error_text
+assert "candidate implementation failed a declared check" in error_text, error_text
+events=[json.loads(line) for line in (pipe/"stage-events.jsonl").read_text().splitlines() if line.strip()]
+failed=[row for row in events if row.get("event")=="stage_attempt_failed" and row.get("stage_id")=="implementation"]
+assert len(failed)==4, failed
+assert [row["data"]["attempt"] for row in failed]==[1,2,3,4], failed
+assert all(row["data"]["max_attempts"]==4 for row in failed), failed
+assert not (pipe/"implementation.json").exists()
+assert not (pipe/"implementation.patch").exists()
+assert not (pipe/"implementation-apply.json").exists()
+assert not (pipe/"checks.json").exists()
+assert not (pipe/"final_documentation.json").exists()
+assert not (pipe/"review.json").exists()
+assert not (pipe/"pr.json").exists()
+assert "Hello from the developer pipeline" not in (root/"repo/src/greeter.py").read_text()
+assert run["developer_pipeline"]["remote_approval_possible"] is False
+PY
+echo "Permanently failing candidate check stopped before implementation application: run=$run_failed"
+
+run_normalized="$(start_run developer_workflow-pass '[safeplane-fake-scenario:documentation_normalization] Adjust the fixture greeting')"
+normalized_run_json="$(wait_run "$run_normalized")"
+python3 - "$normalized_run_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_normalized" <<'PY'
+import json,pathlib,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+baseline=json.loads((pipe/"baseline_documentation.json").read_text())
+patch=(pipe/"baseline_documentation.patch").read_text()
+architecture=(root/"repo/docs/ARCHITECTURE.md").read_text()
+assert baseline["documentation_files"]==["docs/ARCHITECTURE.md"], baseline
+assert "@@ -0,0 +1,10 @@" in patch, patch
+assert "Doc Status: DRAFT" in architecture, architecture
+trace_root=pathlib.Path(run["trace_path"])
+runtime_events=[json.loads(line) for line in (trace_root/"agent-runtime.trace.jsonl").read_text().splitlines() if line.strip()]
+started=[row for row in runtime_events if row.get("event")=="developer_pipeline_model_call_started" and (row.get("input") or {}).get("stage_id")=="baseline_documentation"]
+assert started and (started[0].get("input") or {}).get("request_timeout_seconds")==900, started
+gateway_events=[json.loads(line) for line in (trace_root/"model-gateway.trace.jsonl").read_text().splitlines() if line.strip()]
+resolved=[row for row in gateway_events if row.get("event")=="model_profile_resolved" and (row.get("output") or {}).get("model_profile")=="developer_documentation"]
+assert resolved and (resolved[0].get("output") or {}).get("response_format")=="json_object", resolved
+PY
+echo "Asynchronous run normalized model-authored documentation diff metadata: run=$run_normalized"
+
+run_replacements="$(start_run developer_workflow-pass '[safeplane-fake-scenario:documentation_replacements] Adjust the fixture greeting')"
+replacements_run_json="$(wait_run "$run_replacements")"
+python3 - "$replacements_run_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_replacements" <<'PY'
+import json,pathlib,subprocess,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+baseline=json.loads((pipe/"baseline_documentation.json").read_text())
+patch=(pipe/"baseline_documentation.patch").read_text()
+architecture=(root/"repo/docs/ARCHITECTURE.md").read_text()
+assert baseline["documentation_files"]==["docs/ARCHITECTURE.md"], baseline
+assert patch.startswith("diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md\n"), patch
+assert "new file mode 100644" in patch, patch
+assert "Doc Status: DRAFT" in architecture, architecture
+state=json.loads((pipe/"pipeline.json").read_text())
+doc_runs=[row for row in state["agent_runs"] if row["stage_id"]=="baseline_documentation"]
+assert len(doc_runs)==1 and doc_runs[0]["retry_count"]==0, doc_runs
+checked=subprocess.run(
+    ["git","-c","safe.directory=*","apply","--reverse","--check","--whitespace=nowarn","-"],
+    cwd=root/"repo",
+    input=patch,
+    text=True,
+    capture_output=True,
+    check=False,
+)
+assert checked.returncode==0, checked.stderr or checked.stdout
+PY
+echo "Structured documentation replacements produced a harness-owned valid Git patch: run=$run_replacements"
+
+run_doc_metadata="$(start_run developer_workflow-pass '[safeplane-fake-scenario:documentation_misplaced_metadata] Adjust the fixture greeting')"
+doc_metadata_run_json="$(wait_run "$run_doc_metadata")"
+python3 - "$doc_metadata_run_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_doc_metadata" <<'PY'
+import json,pathlib,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+baseline=json.loads((pipe/"baseline_documentation.json").read_text())
+assert baseline["evidence_notes"]==["Verified repository evidence was complete."], baseline
+assert baseline["uncertainties"]==["Runtime behavior was not executed during documentation."], baseline
+state=json.loads((pipe/"pipeline.json").read_text())
+doc_runs=[row for row in state["agent_runs"] if row["stage_id"]=="baseline_documentation"]
+assert len(doc_runs)==1 and doc_runs[0]["retry_count"]==0, doc_runs
+architecture=(root/"repo/docs/ARCHITECTURE.md").read_text()
+assert "Doc Status: DRAFT" in architecture, architecture
+PY
+echo "Misplaced documentation metadata was relocated without changing replacement text or retrying: run=$run_doc_metadata"
+
+run_planning_commit="$(start_run developer_workflow-pass '[safeplane-fake-scenario:planning_commit_message_normalization] Adjust the fixture greeting')"
+planning_commit_json="$(wait_run "$run_planning_commit")"
+python3 - "$planning_commit_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_planning_commit" <<'PY'
+import json,pathlib,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+plan=json.loads((pipe/"planning.json").read_text())
+message=plan["commit_message"]
+assert len(message)<=120, message
+assert "\n" not in message, message
+assert message==("refactor(config): remove one deprecated entry while preserving the remaining "
+                "configuration and add focused regression"), message
+state=json.loads((pipe/"pipeline.json").read_text())
+planning_runs=[row for row in state["agent_runs"] if row["stage_id"]=="planning"]
+assert len(planning_runs)==1 and planning_runs[0]["retry_count"]==0, planning_runs
+PY
+echo "Overlong planning commit message was deterministically reduced to a safe one-line summary: run=$run_planning_commit"
+
+run_planning_zero="$(start_run developer_workflow-pass '[safeplane-fake-scenario:planning_zero_budget_normalization] Adjust the fixture greeting')"
+planning_zero_json="$(wait_run "$run_planning_zero")"
+python3 - "$planning_zero_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_planning_zero" <<'PY'
+import json,pathlib,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+plan=json.loads((pipe/"planning.json").read_text())
+assert plan["files_to_modify"]==["src/greeter.py"], plan
+assert plan["files_to_create"]==[], plan
+assert plan["files_to_delete"]==[], plan
+assert set(plan["file_change_policy"])=={"src/greeter.py"}, plan
+assert "tests/__init__.py" not in plan["file_change_policy"], plan
+state=json.loads((pipe/"pipeline.json").read_text())
+planning_runs=[row for row in state["agent_runs"] if row["stage_id"]=="planning"]
+assert len(planning_runs)==1 and planning_runs[0]["retry_count"]==0, planning_runs
+PY
+echo "Zero-budget planning paths were removed without expanding implementation authority: run=$run_planning_zero"
+
+run_planning_check="$(start_run developer_workflow-pass '[safeplane-fake-scenario:planning_check_command_retry] Adjust the fixture greeting')"
+planning_check_json="$(wait_run "$run_planning_check")"
+python3 - "$planning_check_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_planning_check" <<'PY'
+import json,pathlib,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+plan=json.loads((pipe/"planning.json").read_text())
+assert plan["test_commands"]==[["python3","checks/check_greeting.py"]], plan
+state=json.loads((pipe/"pipeline.json").read_text())
+planning_runs=[row for row in state["agent_runs"] if row["stage_id"]=="planning"]
+assert len(planning_runs)==1, planning_runs
+assert planning_runs[0]["retry_count"]==1, planning_runs
+assert planning_runs[0]["model_call_count"]==2, planning_runs
+events=[json.loads(line) for line in (pipe/"stage-events.jsonl").read_text().splitlines() if line.strip()]
+failures=[row for row in events if row.get("event")=="stage_attempt_failed" and row.get("stage_id")=="planning"]
+assert len(failures)==1, failures
+PY
+echo "Ungrounded planning check command was rejected and repaired before implementation: run=$run_planning_check"
+
+run_implementation_tools="$(start_run developer_workflow-pass '[safeplane-fake-scenario:implementation_multi_tool_loop] Adjust the fixture greeting')"
+implementation_tools_json="$(wait_run "$run_implementation_tools")"
+python3 - "$implementation_tools_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_implementation_tools" <<'PY'
+import json,pathlib,subprocess,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+state=json.loads((pipe/"pipeline.json").read_text())
+patch=(pipe/"implementation.patch").read_text()
+implementation_runs=[row for row in state["agent_runs"] if row["stage_id"]=="implementation"]
+assert len(implementation_runs)==1, implementation_runs
+implementation_run=implementation_runs[0]
+assert implementation_run["model_call_count"]==3, implementation_run
+assert implementation_run["tool_call_count"]==2, implementation_run
+assert implementation_run["retry_count"]==0, implementation_run
+messages_path=pathlib.Path(run["trace_path"])/"messages.developer.implementation.json"
+messages=json.loads(messages_path.read_text())["messages"]
+conversation="\n".join(str(row.get("content") or "") for row in messages)
+assert "dev_workspace_grep" in conversation, conversation
+assert "dev_workspace_read" in conversation, conversation
+checked=subprocess.run(
+    ["git","-c","safe.directory=*","apply","--reverse","--check","--whitespace=nowarn","-"],
+    cwd=root/"repo",
+    input=patch,
+    text=True,
+    capture_output=True,
+    check=False,
+)
+assert checked.returncode==0, checked.stderr or checked.stdout
+assert "Hello from the developer pipeline" in (root/"repo/src/greeter.py").read_text()
+PY
+echo "Implementation agent completed repeated MCP tool turns before returning final: run=$run_implementation_tools"
+
+run_implementation_retry="$(start_run developer_workflow-pass '[safeplane-fake-scenario:implementation_patch_retry] Adjust the fixture greeting')"
+implementation_retry_json="$(wait_run "$run_implementation_retry")"
+python3 - "$implementation_retry_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_implementation_retry" <<'PY'
+import json,pathlib,subprocess,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+state=json.loads((pipe/"pipeline.json").read_text())
+patch=(pipe/"implementation.patch").read_text()
+implementation_runs=[row for row in state["agent_runs"] if row["stage_id"]=="implementation"]
+assert len(implementation_runs)==1, implementation_runs
+assert implementation_runs[0]["retry_count"]==1, implementation_runs[0]
+assert implementation_runs[0]["model_call_count"]==3, implementation_runs[0]
+assert implementation_runs[0]["tool_call_count"]==1, implementation_runs[0]
+events=[json.loads(line) for line in (pipe/"stage-events.jsonl").read_text().splitlines() if line.strip()]
+failed=[row for row in events if row.get("event")=="stage_attempt_failed" and row.get("stage_id")=="implementation"]
+assert len(failed)==1, failed
+messages_path=pathlib.Path(run["trace_path"])/"messages.developer.implementation.json"
+message_artifact=json.loads(messages_path.read_text())
+messages=message_artifact["messages"]
+repair_text="\n".join(str(row.get("content") or "") for row in messages if row.get("role")=="user")
+assert "implementation replacement old_text must match exactly once" in repair_text, repair_text
+assert "src/greeter.py" in repair_text, repair_text
+checked=subprocess.run(
+    ["git","-c","safe.directory=*","apply","--reverse","--check","--whitespace=nowarn","-"],
+    cwd=root/"repo",
+    input=patch,
+    text=True,
+    capture_output=True,
+    check=False,
+)
+assert checked.returncode==0, checked.stderr or checked.stdout
+assert "Hello from the developer pipeline" in (root/"repo/src/greeter.py").read_text()
+PY
+echo "Invalid implementation final was rejected, repaired, and completed after MCP inspection: run=$run_implementation_retry"
+
+run_implementation_budget="$(start_run developer_workflow-pass '[safeplane-fake-scenario:implementation_budget_retry] Adjust the fixture greeting')"
+implementation_budget_json="$(wait_run "$run_implementation_budget")"
+python3 - "$implementation_budget_json" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_implementation_budget" <<'PY'
+import json,pathlib,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+state=json.loads((pipe/"pipeline.json").read_text())
+implementation_runs=[row for row in state["agent_runs"] if row["stage_id"]=="implementation"]
+assert len(implementation_runs)==1, implementation_runs
+implementation_run=implementation_runs[0]
+assert implementation_run["retry_count"]==1, implementation_run
+assert implementation_run["model_call_count"]==3, implementation_run
+assert implementation_run["tool_call_count"]==1, implementation_run
+events=[json.loads(line) for line in (pipe/"stage-events.jsonl").read_text().splitlines() if line.strip()]
+failed=[row for row in events if row.get("event")=="stage_attempt_failed" and row.get("stage_id")=="implementation"]
+assert len(failed)==1, failed
+messages_path=pathlib.Path(run["trace_path"])/"messages.developer.implementation.json"
+messages=json.loads(messages_path.read_text())["messages"]
+repair_text="\n".join(str(row.get("content") or "") for row in messages if row.get("role")=="user")
+assert "changed-line budget exceeded for src/greeter.py: 5 > 4" in repair_text, repair_text
+assert "every line of a newly created file counts as changed" in repair_text, repair_text
+assert "Hello from the developer pipeline" in (root/"repo/src/greeter.py").read_text()
+PY
+echo "Over-budget implementation final was rejected and repaired before patch application: run=$run_implementation_budget"
+
+run_implementation_check="$(start_run developer_workflow-pass '[safeplane-fake-scenario:implementation_candidate_check_retry] Adjust the fixture greeting')"
+implementation_check_json="$(wait_run "$run_implementation_check")"
+python3 - "$implementation_check_json" <<'PY_CHECK_RUN'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY_CHECK_RUN
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_implementation_check" <<'PY_CHECK_ARTIFACTS'
+import json,pathlib,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+state=json.loads((pipe/"pipeline.json").read_text())
+implementation_runs=[row for row in state["agent_runs"] if row["stage_id"]=="implementation"]
+assert len(implementation_runs)==1, implementation_runs
+implementation_run=implementation_runs[0]
+assert implementation_run["retry_count"]==1, implementation_run
+assert implementation_run["model_call_count"]==3, implementation_run
+assert implementation_run["tool_call_count"]==1, implementation_run
+events=[json.loads(line) for line in (pipe/"stage-events.jsonl").read_text().splitlines() if line.strip()]
+failed=[row for row in events if row.get("event")=="stage_attempt_failed" and row.get("stage_id")=="implementation"]
+assert len(failed)==1, failed
+messages_path=pathlib.Path(run["trace_path"])/"messages.developer.implementation.json"
+messages=json.loads(messages_path.read_text())["messages"]
+repair_text="\n".join(str(row.get("content") or "") for row in messages if row.get("role")=="user")
+assert "candidate implementation failed a declared check before final acceptance" in repair_text, repair_text
+assert "developer pipeline" in repair_text, repair_text
+assert "Hello from the developer pipeline" in (root/"repo/src/greeter.py").read_text()
+checks=json.loads((pipe/"checks.json").read_text())
+assert checks["status"]=="passed", checks
+PY_CHECK_ARTIFACTS
+echo "Failing candidate check was returned to the implementation agent and repaired before final acceptance: run=$run_implementation_check"
+
+run_implementation_chained="$(start_run developer_workflow-pass '[safeplane-fake-scenario:implementation_candidate_check_then_budget_retry] Adjust the fixture greeting')"
+implementation_chained_json="$(wait_run "$run_implementation_chained")"
+python3 - "$implementation_chained_json" <<'PY_CHAINED_RUN'
+import json,sys
+run=json.loads(sys.argv[1])
+assert run.get("status")=="completed", run
+assert (run.get("developer_pipeline") or {}).get("current_state")=="waiting_for_remote_approval", run
+PY_CHAINED_RUN
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_implementation_chained" <<'PY_CHAINED_ARTIFACTS'
+import json,pathlib,sys
+home=pathlib.Path(sys.argv[1]); run_id=sys.argv[2]
+run=json.loads((home/"runs"/f"{run_id}.json").read_text())
+root=home/"workspaces"/run_id; pipe=root/"pipeline"
+state=json.loads((pipe/"pipeline.json").read_text())
+implementation_runs=[row for row in state["agent_runs"] if row["stage_id"]=="implementation"]
+assert len(implementation_runs)==1, implementation_runs
+implementation_run=implementation_runs[0]
+assert implementation_run["retry_count"]==3, implementation_run
+assert implementation_run["model_call_count"]==5, implementation_run
+assert implementation_run["tool_call_count"]==1, implementation_run
+events=[json.loads(line) for line in (pipe/"stage-events.jsonl").read_text().splitlines() if line.strip()]
+failed=[row for row in events if row.get("event")=="stage_attempt_failed" and row.get("stage_id")=="implementation"]
+assert len(failed)==3, failed
+messages_path=pathlib.Path(run["trace_path"])/"messages.developer.implementation.json"
+messages=json.loads(messages_path.read_text())["messages"]
+repair_text="\n".join(str(row.get("content") or "") for row in messages if row.get("role")=="user")
+assert "candidate implementation failed a declared check before final acceptance" in repair_text, repair_text
+assert "changed-line budget exceeded for src/greeter.py: 5 > 4" in repair_text, repair_text
+assert "Hello from the developer pipeline" in (root/"repo/src/greeter.py").read_text()
+PY_CHAINED_ARTIFACTS
+echo "Candidate-check and repeated budget repairs completed within the fourth bounded implementation attempt: run=$run_implementation_chained"
+
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/target-pass.git" rev-parse HEAD)" == "$pass_commit" ]]
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/target-fail.git" rev-parse HEAD)" == "$fail_commit" ]]
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/skills.git" rev-parse HEAD)" == "$skill_commit" ]]
+
+echo "Source fixture remotes remained unchanged"
+echo "OK: single-pass developer workflow single-pass developer workflow passed"

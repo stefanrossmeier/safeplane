@@ -1,0 +1,4 @@
+services:
+  harness:
+    ports:
+      - "127.0.0.1:${SAFEPLANE_HARNESS_PORT:-8787}:8080"

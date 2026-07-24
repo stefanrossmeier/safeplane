@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+SECRET_PATTERNS = (
+    re.compile(r"github_pat_[A-Za-z0-9_]+"),
+    re.compile(r"ghp_[A-Za-z0-9]+"),
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate a sanitized public case study from one completed developer run."
+    )
+    parser.add_argument("run_id")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--expected-profile")
+    parser.add_argument("--task-summary", required=True)
+    parser.add_argument("--operator-findings", required=True)
+    parser.add_argument("--defects-found", required=True)
+    parser.add_argument("--fixes-made", required=True)
+    parser.add_argument("--known-limitations", required=True)
+    parser.add_argument(
+        "--telegram-proof",
+        default="Not included in this run; validate separately through the Telegram connector.",
+    )
+    return parser.parse_args()
+
+
+def safeplane_home() -> Path:
+    return Path(os.environ.get("SAFEPLANE_HOME", str(Path.home() / ".safeplane"))).expanduser()
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise SystemExit(f"Required Safeplane artifact is missing: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON artifact: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SystemExit(f"Expected a JSON object: {path}")
+    return value
+
+
+def display(value: Any, fallback: str = "not reported") -> str:
+    if value is None or value == "":
+        return fallback
+    return str(value)
+
+
+def markdown_cell(value: Any) -> str:
+    return display(value).replace("|", "\\|").replace("\n", " ")
+
+
+def assert_safe_output(text: str, home: Path, repository_name: str | None) -> None:
+    for pattern in SECRET_PATTERNS:
+        if pattern.search(text):
+            raise SystemExit("Generated case study contains a secret-like token pattern")
+    home_text = str(home.resolve())
+    if home_text and home_text in text:
+        raise SystemExit("Generated case study contains the private SAFEPLANE_HOME path")
+    if repository_name and repository_name in text:
+        raise SystemExit("Generated case study contains the private repository identifier")
+
+
+def main() -> None:
+    args = parse_args()
+    home = safeplane_home()
+    run = load_json(home / "runs" / f"{args.run_id}.json")
+
+    if run.get("workflow_id") != "developer":
+        raise SystemExit("Case studies can only be generated for developer runs")
+    if args.expected_profile and run.get("repository_profile") != args.expected_profile:
+        raise SystemExit(
+            f"Run profile mismatch: expected {args.expected_profile!r}, "
+            f"got {run.get('repository_profile')!r}"
+        )
+
+    pipeline = run.get("developer_pipeline") or {}
+    remote = run.get("remote_write") or pipeline.get("remote_write") or {}
+    if pipeline.get("current_state") != "completed":
+        raise SystemExit("Case study requires a completed remote-write run")
+    if remote.get("status") != "completed" or remote.get("draft") is not True:
+        raise SystemExit("Case study requires a completed draft pull request")
+    if pipeline.get("review_verdict") != "LGTM":
+        raise SystemExit("Case study requires an LGTM review verdict")
+    check_summary = pipeline.get("check_summary") or {}
+    if check_summary.get("status") != "passed":
+        raise SystemExit("Case study requires passing controlled checks")
+
+    workspace = run.get("repository_workspace") or {}
+    binding = pipeline.get("remote_approval_binding") or {}
+    repository_name = binding.get("repository_name")
+    target_commit = workspace.get("target_commit") or binding.get("base_commit")
+    skill_commit = (workspace.get("external_source_commits") or {}).get("archdoc")
+    pr_number = remote.get("pull_request_number")
+
+    lines = [
+        "# External Repository Case Study",
+        "",
+        "> Sanitized public evidence generated from Safeplane runtime metadata.",
+        "> No repository source content, credential, private path, or repository URL is included.",
+        "",
+        "## Summary",
+        "",
+        f"- Safeplane run: `{args.run_id}`",
+        "- Target: external repository (identity omitted)",
+        f"- Task: {args.task_summary}",
+        f"- Target base commit: `{display(target_commit)}`",
+        f"- External `archdoc` commit: `{display(skill_commit)}`",
+        f"- Review verdict: `{display(pipeline.get('review_verdict'))}`",
+        f"- Plan alignment: `{display(pipeline.get('review_plan_alignment'))}`",
+        f"- Draft pull request: `#{display(pr_number)}` (repository URL omitted)",
+        "- Merge status: not merged by Safeplane",
+        "",
+        "## Fixed stage sequence",
+        "",
+    ]
+    for stage in pipeline.get("completed_stages") or []:
+        lines.append(f"1. `{stage}`")
+
+    lines.extend([
+        "",
+        "## Model execution",
+        "",
+        "| Stage | Profile | Configured model | Actual provider | Actual model | Retries | Duration | Tokens | Cost |",
+        "|---|---|---|---|---|---:|---:|---:|---:|",
+    ])
+    for item in pipeline.get("agent_runs") or []:
+        lines.append("| " + " | ".join([
+            markdown_cell(item.get("stage_id")),
+            markdown_cell(item.get("model_profile")),
+            markdown_cell(item.get("configured_model")),
+            markdown_cell(item.get("actual_provider")),
+            markdown_cell(item.get("actual_model")),
+            markdown_cell(item.get("retry_count", 0)),
+            markdown_cell(f"{item.get('duration_ms', 0)} ms"),
+            markdown_cell(item.get("total_tokens")),
+            markdown_cell(item.get("cost")),
+        ]) + " |")
+
+    lines.extend([
+        "",
+        "## Controlled checks",
+        "",
+        "| Profile | Status | Exit code | Duration | Network |",
+        "|---|---|---:|---:|---|",
+    ])
+    for item in check_summary.get("commands") or []:
+        lines.append("| " + " | ".join([
+            markdown_cell(item.get("profile_id")),
+            markdown_cell(item.get("status")),
+            markdown_cell(item.get("exit_code")),
+            markdown_cell(f"{item.get('duration_ms', 0)} ms"),
+            markdown_cell(item.get("network_policy")),
+        ]) + " |")
+
+    artifact_names = sorted((pipeline.get("artifacts") or {}).keys())
+    lines.extend([
+        "",
+        "## Artifacts produced",
+        "",
+        *[f"- `{name}`" for name in artifact_names],
+        "",
+        "## Operator findings",
+        "",
+        args.operator_findings,
+        "",
+        "## Defects found",
+        "",
+        args.defects_found,
+        "",
+        "## Fixes made",
+        "",
+        args.fixes_made,
+        "",
+        "## Telegram evidence",
+        "",
+        args.telegram_proof,
+        "",
+        "## Known limitations",
+        "",
+        args.known_limitations,
+        "",
+        "## Human decision boundary",
+        "",
+        "Safeplane created a draft pull request only after the configured policy boundary passed. "
+        "It did not merge, release, or deploy the target repository.",
+        "",
+    ])
+
+    text = "\n".join(lines)
+    assert_safe_output(text, home, repository_name)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text, encoding="utf-8")
+    print(f"Wrote sanitized case study: {output}")
+
+
+if __name__ == "__main__":
+    main()

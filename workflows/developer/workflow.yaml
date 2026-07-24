@@ -1,0 +1,443 @@
+workflow_id: developer
+version: 0.9.0
+description: Complete single-pass Safeplane developer workflow with exact-plan review and harness-owned draft-PR publication.
+supported_entrypoints:
+- developer
+- develop
+examples:
+- Inspect this repository and explain its architecture
+- Propose a focused patch for this bug
+- Run the staged developer workflow for this bounded task
+prompt:
+  id: developer.system
+  version: v1
+  path: /app/prompts/developer/system.v1.md
+model_profiles:
+  default:
+    litellm_model: openrouter/openrouter/free
+    temperature: 0.2
+    max_tokens: 4000
+  developer_documentation:
+    litellm_model: openrouter/openai/gpt-5-mini
+    temperature: 0.1
+    max_tokens: 30000
+    request_timeout_seconds: 900
+    response_format: json_object
+    fake_responses:
+      baseline_documentation: prompts/developer/fake/baseline-documentation.v1.json
+      final_documentation: prompts/developer/fake/final-documentation.v1.json
+      baseline_documentation_live: prompts/developer/fake/baseline-documentation-live.v1.json
+      baseline_documentation_preserve: prompts/developer/fake/baseline-documentation-preserve.v1.json
+      baseline_documentation_normalization: prompts/developer/fake/baseline-documentation-normalization.v1.json
+      baseline_documentation_replacements: prompts/developer/fake/baseline-documentation-replacements.v1.json
+      baseline_documentation_misplaced_metadata: prompts/developer/fake/baseline-documentation-misplaced-metadata.v1.json
+      final_documentation_live: prompts/developer/fake/final-documentation-live.v1.json
+  developer_analysis:
+    litellm_model: openrouter/anthropic/claude-haiku-4.5
+    temperature: 0.2
+    max_tokens: 5000
+    request_timeout_seconds: 600
+    fake_responses:
+      analysis: prompts/developer/fake/analysis.v1.json
+  developer_planning:
+    litellm_model: openrouter/anthropic/claude-sonnet-4.6
+    temperature: 0.1
+    max_tokens: 5000
+    request_timeout_seconds: 600
+    fake_responses:
+      planning: prompts/developer/fake/planning.v1.json
+      planning_long_commit_message: prompts/developer/fake/planning-long-commit-message.v1.json
+      planning_zero_budget_noop: prompts/developer/fake/planning-zero-budget-noop.v1.json
+      planning_invalid_check:
+      - prompts/developer/fake/planning-invalid-check.v1.json
+      - prompts/developer/fake/planning.v1.json
+  developer_implementation:
+    litellm_model: openrouter/openai/gpt-5-mini
+    temperature: 0.1
+    max_tokens: 7000
+    request_timeout_seconds: 1200
+    fake_responses:
+      implementation:
+      - prompts/developer/fake/implementation-tool-read.v2.json
+      - prompts/developer/fake/implementation-final.v2.json
+      implementation_malformed:
+      - prompts/developer/fake/implementation-tool-read.v2.json
+      - prompts/developer/fake/implementation-final-invalid-old-text.v2.json
+      - prompts/developer/fake/implementation-final.v2.json
+      implementation_multi_tool:
+      - prompts/developer/fake/implementation-tool-grep.v2.json
+      - prompts/developer/fake/implementation-tool-read.v2.json
+      - prompts/developer/fake/implementation-final.v2.json
+      implementation_budget_retry:
+      - prompts/developer/fake/implementation-tool-read.v2.json
+      - prompts/developer/fake/implementation-final-over-budget.v2.json
+      - prompts/developer/fake/implementation-final.v2.json
+      implementation_check_retry:
+      - prompts/developer/fake/implementation-tool-read.v2.json
+      - prompts/developer/fake/implementation-final-check-fails.v2.json
+      - prompts/developer/fake/implementation-final.v2.json
+      implementation_check_then_budget_retry:
+      - prompts/developer/fake/implementation-tool-read.v2.json
+      - prompts/developer/fake/implementation-final-check-fails.v2.json
+      - prompts/developer/fake/implementation-final-over-budget.v2.json
+      - prompts/developer/fake/implementation-final-over-budget.v2.json
+      - prompts/developer/fake/implementation-final.v2.json
+  developer_review:
+    litellm_model: openrouter/anthropic/claude-haiku-4.5
+    temperature: 0.0
+    max_tokens: 4000
+    request_timeout_seconds: 600
+    fake_responses:
+      review: prompts/developer/fake/review-lgtm.v1.json
+      review_changes_requested: prompts/developer/fake/review-request-changes.v1.json
+  developer_pr:
+    litellm_model: openrouter/openai/gpt-5.4-nano
+    temperature: 0.2
+    max_tokens: 3000
+    request_timeout_seconds: 300
+    fake_responses:
+      pr: prompts/developer/fake/pr.v1.json
+agents:
+  documentation:
+    prompt:
+      id: developer.documentation.system
+      version: v3
+      path: prompts/developer/documentation.system.v3.md
+    model_profile: developer_documentation
+    max_model_attempts: 3
+    input_artifacts:
+    - repository_context
+    - implementation_patch
+    - check_result
+    output_schema: DocumentationResult
+    allowed_mcp_servers:
+      dev-workspace:
+        tools:
+        - dev_workspace_list
+        - dev_workspace_find
+        - dev_workspace_grep
+        - dev_workspace_read
+        - dev_git_metadata
+        - dev_git_status
+        - dev_git_diff
+        - dev_git_log
+        - dev_git_show
+        - dev_git_tracked_files
+        - dev_external_skill_list
+        - dev_external_skill_read
+        - dev_workspace_propose_patch
+  analysis:
+    prompt:
+      id: developer.analysis.system
+      version: v1
+      path: prompts/developer/analysis.system.v1.md
+    model_profile: developer_analysis
+    max_model_attempts: 3
+    input_artifacts:
+    - developer_request
+    - repository_context
+    - baseline_documentation
+    output_schema: AnalysisResult
+    allowed_mcp_servers:
+      dev-workspace:
+        tools: &id001
+        - dev_workspace_list
+        - dev_workspace_find
+        - dev_workspace_grep
+        - dev_workspace_read
+        - dev_git_metadata
+        - dev_git_status
+        - dev_git_diff
+        - dev_git_log
+        - dev_git_show
+        - dev_git_tracked_files
+  planning:
+    prompt:
+      id: developer.planning.system
+      version: v6
+      path: prompts/developer/planning.system.v6.md
+    model_profile: developer_planning
+    max_model_attempts: 3
+    input_artifacts:
+    - developer_request
+    - repository_context
+    - baseline_documentation
+    - analysis
+    output_schema: ImplementationPlan
+    allowed_mcp_servers:
+      dev-workspace:
+        tools: *id001
+  implementation:
+    prompt:
+      id: developer.implementation.system
+      version: v7
+      path: prompts/developer/implementation.system.v7.md
+    model_profile: developer_implementation
+    max_model_attempts: 4
+    tool_loop_timeout_seconds: 3600
+    input_artifacts:
+    - developer_request
+    - repository_context
+    - baseline_documentation
+    - analysis
+    - implementation_plan
+    output_schema: ImplementationPatch
+    allowed_mcp_servers:
+      dev-workspace:
+        tools:
+        - dev_workspace_list
+        - dev_workspace_find
+        - dev_workspace_grep
+        - dev_workspace_read
+        - dev_git_metadata
+        - dev_git_status
+        - dev_git_diff
+        - dev_git_log
+        - dev_git_show
+        - dev_git_tracked_files
+        - dev_workspace_propose_patch
+  review:
+    prompt:
+      id: developer.review.system
+      version: v2
+      path: prompts/developer/review.system.v2.md
+    model_profile: developer_review
+    max_model_attempts: 2
+    input_artifacts:
+    - developer_request
+    - repository_context
+    - baseline_documentation
+    - analysis
+    - implementation_plan
+    - implementation_patch
+    - implementation_apply
+    - check_result
+    - final_documentation
+    output_schema: ReviewResult
+    allowed_mcp_servers:
+      dev-workspace:
+        tools: *id001
+  pr:
+    prompt:
+      id: developer.pr.system
+      version: v1
+      path: prompts/developer/pr.system.v1.md
+    model_profile: developer_pr
+    max_model_attempts: 2
+    input_artifacts:
+    - developer_request
+    - analysis
+    - implementation_plan
+    - implementation_patch
+    - implementation_apply
+    - check_result
+    - final_documentation
+    - review_result
+    output_schema: PrProposal
+    allowed_mcp_servers: {}
+developer_pipeline:
+  enabled: true
+  version: v1
+  entrypoint: develop
+  prompt_manifest: prompts/developer/manifest.yaml
+  single_pass: true
+  automatic_rework: false
+  stages:
+  - id: baseline_documentation
+    agent: documentation
+    output_schema: DocumentationResult
+  - id: analysis
+    agent: analysis
+    output_schema: AnalysisResult
+  - id: planning
+    agent: planning
+    output_schema: ImplementationPlan
+  - id: implementation
+    agent: implementation
+    output_schema: ImplementationPatch
+  - id: final_documentation
+    agent: documentation
+    output_schema: DocumentationResult
+  - id: review
+    agent: review
+    output_schema: ReviewResult
+  - id: pr
+    agent: pr
+    output_schema: PrProposal
+  fake_scenarios:
+    default:
+      stage_response_keys: {}
+    review_changes_requested:
+      stage_response_keys:
+        review: review_changes_requested
+    documentation_preserve:
+      stage_response_keys:
+        baseline_documentation: baseline_documentation_preserve
+        final_documentation: final_documentation_live
+    documentation_normalization:
+      stage_response_keys:
+        baseline_documentation: baseline_documentation_normalization
+        final_documentation: final_documentation_live
+    implementation_patch_retry:
+      stage_response_keys:
+        implementation: implementation_malformed
+    implementation_multi_tool_loop:
+      stage_response_keys:
+        implementation: implementation_multi_tool
+    implementation_budget_retry:
+      stage_response_keys:
+        implementation: implementation_budget_retry
+    implementation_candidate_check_retry:
+      stage_response_keys:
+        implementation: implementation_check_retry
+    implementation_candidate_check_then_budget_retry:
+      stage_response_keys:
+        implementation: implementation_check_then_budget_retry
+    planning_commit_message_normalization:
+      stage_response_keys:
+        planning: planning_long_commit_message
+    planning_zero_budget_normalization:
+      stage_response_keys:
+        planning: planning_zero_budget_noop
+    planning_check_command_retry:
+      stage_response_keys:
+        planning: planning_invalid_check
+    documentation_replacements:
+      stage_response_keys:
+        baseline_documentation: baseline_documentation_replacements
+        final_documentation: final_documentation_live
+    documentation_misplaced_metadata:
+      stage_response_keys:
+        baseline_documentation: baseline_documentation_misplaced_metadata
+        final_documentation: final_documentation_live
+  documentation_runtime:
+    enabled: true
+    source_id: archdoc
+    skill_entrypoint: SKILL.md
+    target_document_paths:
+    - docs/REPO_MAP.md
+    - docs/ARCHITECTURE.md
+    - docs/API_SURFACE.md
+    - docs/OPERATIONS.md
+    max_skill_files: 12
+    max_skill_total_bytes: 131072
+    max_skill_file_bytes: 65536
+    read_page_lines: 2000
+    tracked_file_page_size: 1000
+    max_repository_files: 10000
+    max_repository_total_bytes: 8388608
+    max_repository_file_bytes: 1048576
+    require_complete_repository_evidence: true
+    max_changed_lines_per_file: 4000
+    max_hunks_per_file: 100
+session:
+  receives_history: true
+concurrency:
+  same_session: serial
+  different_sessions: parallel
+runtime_context:
+  timezone: Europe/Berlin
+repository_workspace:
+  profiles_path_env: SAFEPLANE_REPOSITORY_CONFIG
+  profiles_path_default: /data/safeplane/config/repositories.yaml
+  external_sources:
+    archdoc:
+      repository_url: https://github.com/stefanrossmeier/ai-craftkit.git
+      repository_url_env: SAFEPLANE_ARCHDOC_REPOSITORY_URL
+      ref: main
+      checkout_name: ai-craftkit
+      required_path: skills/archdoc
+      allowed_hosts:
+      - github.com
+      allowed_repository: stefanrossmeier/ai-craftkit
+      allowed_agents:
+      - documentation
+      read_only: true
+      allow_file_url_for_tests: true
+workspace:
+  source_root_env: SAFEPLANE_DEVELOPER_SOURCE_ROOT
+  logical_root: /workspace
+  read_only: true
+  exclude:
+  - .git
+  - .venv
+  - .mypy_cache
+  - .pytest_cache
+  - .ruff_cache
+  - __pycache__
+  - node_modules
+  - dist
+  - build
+  - .safeplane
+mcp:
+  servers:
+  - dev-workspace
+  - dev-check
+  max_tool_call_retries: 5
+  allowed_servers:
+    dev-workspace:
+      tools:
+      - dev_workspace_ready
+      - dev_workspace_list
+      - dev_workspace_find
+      - dev_workspace_grep
+      - dev_workspace_read
+      - dev_git_metadata
+      - dev_git_status
+      - dev_git_diff
+      - dev_git_log
+      - dev_git_show
+      - dev_git_tracked_files
+      - dev_external_skill_list
+      - dev_external_skill_read
+      - dev_workspace_propose_patch
+    dev-check:
+      tools:
+      - dev_check_run
+  approval_required_servers:
+    dev-workspace-apply:
+      tools:
+      - dev_workspace_apply_patch
+  model_allowed_servers:
+    dev-workspace:
+      tools:
+      - dev_workspace_list
+      - dev_workspace_find
+      - dev_workspace_grep
+      - dev_workspace_read
+      - dev_git_metadata
+      - dev_git_status
+      - dev_git_diff
+      - dev_git_log
+      - dev_git_show
+      - dev_git_tracked_files
+      - dev_workspace_propose_patch
+tools:
+  enabled: false
+  allowed: []
+functions:
+  enabled: false
+  allowed: []
+io:
+  input:
+    messages: list
+  output:
+    final_message: string
+deterministic_tools:
+  enabled:
+  - developer
+developer_tools:
+  command_profiles:
+    python_check:
+      executable: python3
+      allowed_roots:
+      - checks
+      - scripts/checks
+      - tests
+      allowed_suffixes:
+      - .py
+      network: disabled
+      timeout_seconds: 10
+      max_output_bytes: 65536
+      cpu_seconds: 15
+      memory_bytes: 268435456

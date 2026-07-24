@@ -1,0 +1,8 @@
+{
+  "verdict": "LGTM",
+  "summary": "The fake change is bounded by the plan, the declared checks passed, and the documentation result is consistent.",
+  "requested_changes": [],
+  "docs_update_needed": false,
+  "risk_notes": [],
+  "plan_alignment": "ALIGNED"
+}

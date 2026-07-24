@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+
+OPERATOR_ENV = Path(os.environ.get("SAFEPLANE_OPERATOR_ENV", "/etc/safeplane/operator.env"))
+
+
+def load_operator_env() -> None:
+    """Load trusted operator defaults without overriding explicit shell values."""
+    if not OPERATOR_ENV.is_file():
+        return
+    for line_number, raw_line in enumerate(OPERATOR_ENV.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise SystemExit(f"ERROR: malformed operator environment line {line_number}: {OPERATOR_ENV}")
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not name.replace("_", "a").isalnum() or name[0].isdigit():
+            raise SystemExit(f"ERROR: invalid operator environment name on line {line_number}: {OPERATOR_ENV}")
+        os.environ.setdefault(name, value)
+
+
+load_operator_env()
+COMPOSE = ROOT / "scripts" / "compose-safeplane-vps"
+REQUIRED_SECRETS = (
+    "openrouter_api_key",
+    "telegram_bot_token",
+    "telegram_allowed_user_ids",
+)
+BASE_SERVICES = (
+    "model-gateway",
+    "calendar-task-mcp",
+    "scheduler",
+    "notification-task-mcp",
+    "harness",
+    "telegram-connector",
+)
+DEVELOPER_SERVICES = (
+    "dev-workspace-mcp",
+    "dev-workspace-apply-mcp",
+    "dev-check-mcp",
+)
+BACKUP_MEMBERS = (
+    "sessions",
+    "runs",
+    "traces",
+    "data",
+    "connectors",
+    "config",
+    "logs",
+    "deployment",
+)
+
+
+def run(command: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=ROOT,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+
+
+def compose(*args: str, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return run([str(COMPOSE), *args], capture=capture, check=check)
+
+
+def env_path(name: str) -> Path:
+    value = os.environ.get(name)
+    if not value:
+        raise SystemExit(f"ERROR: {name} is not set; load /etc/safeplane/operator.env")
+    path = Path(value).expanduser().resolve(strict=False)
+    if str(path) == "/":
+        raise SystemExit(f"ERROR: refusing unsafe {name}={path}")
+    return path
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_revision() -> str:
+    return run(["git", "rev-parse", "HEAD"], capture=True).stdout.strip()
+
+
+def require_clean_checkout() -> None:
+    status = run(["git", "status", "--porcelain"], capture=True).stdout
+    if status.strip():
+        raise SystemExit("ERROR: checkout is not clean; commit or stash changes first")
+
+
+def active_profile() -> str:
+    profile = os.environ.get("SAFEPLANE_VPS_PROFILE", "assistant")
+    if profile not in {"assistant", "developer"}:
+        raise SystemExit("ERROR: SAFEPLANE_VPS_PROFILE must be assistant or developer")
+    return profile
+
+
+def services_for_profile(profile: str | None = None) -> tuple[str, ...]:
+    selected = profile or active_profile()
+    if selected == "developer":
+        return BASE_SERVICES + DEVELOPER_SERVICES
+    return BASE_SERVICES
+
+
+def profile_marker() -> Path:
+    return env_path("SAFEPLANE_HOME") / "deployment" / "active_profile"
+
+
+def recorded_profile() -> str | None:
+    marker = profile_marker()
+    if not marker.is_file():
+        return None
+    value = marker.read_text(encoding="utf-8").strip()
+    return value if value in {"assistant", "developer"} else None
+
+
+def record_profile(profile: str) -> None:
+    marker = profile_marker()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(profile + "\n", encoding="utf-8")
+
+
+def inspect_service(service: str) -> tuple[str, str, str]:
+    result = compose("ps", "-q", service, capture=True)
+    container_id = result.stdout.strip()
+    if not container_id:
+        return "missing", "none", ""
+    inspected = run(
+        [
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.HostConfig.RestartPolicy.Name}}",
+            container_id,
+        ],
+        capture=True,
+    ).stdout.strip()
+    state, health, restart = inspected.split("|", 2)
+    return state, health, restart
+
+
+def service_ready(state: str, health: str) -> bool:
+    return state == "running" and health in {"healthy", "none"}
+
+
+def wait_healthy(timeout: int) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        states = [inspect_service(service) for service in services_for_profile()]
+        if all(service_ready(state, health) for state, health, _ in states):
+            return
+        time.sleep(2)
+    status(argparse.Namespace(json=False))
+    raise SystemExit(f"ERROR: services did not become ready within {timeout}s")
+
+
+def published_ports() -> list[str]:
+    result: list[str] = []
+    for service in services_for_profile():
+        container_id = compose("ps", "-q", service, capture=True).stdout.strip()
+        if not container_id:
+            continue
+        output = run(["docker", "port", container_id], capture=True).stdout.strip()
+        if output:
+            result.extend(f"{service}: {line}" for line in output.splitlines())
+    return result
+
+
+def preflight(_: argparse.Namespace) -> None:
+    failures: list[str] = []
+    warnings: list[str] = []
+
+    if platform.system() != "Linux":
+        failures.append(f"unsupported OS: {platform.system()}")
+    if platform.machine() not in {"x86_64", "amd64"}:
+        failures.append(f"unsupported architecture: {platform.machine()}")
+    try:
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8")
+        if "Ubuntu" not in os_release or 'VERSION_ID="24.04"' not in os_release:
+            failures.append("supported target is Ubuntu 24.04 LTS")
+    except FileNotFoundError:
+        failures.append("/etc/os-release is missing")
+
+    for command in (["docker", "info"], ["docker", "compose", "version"]):
+        result = run(command, check=False, capture=True)
+        if result.returncode:
+            failures.append(f"command failed: {' '.join(command)}")
+
+    paths: dict[str, Path] = {}
+    for name in ("SAFEPLANE_HOME", "SAFEPLANE_SECRET_ROOT", "SAFEPLANE_BACKUP_ROOT", "SAFEPLANE_LOG_ROOT"):
+        try:
+            paths[name] = env_path(name)
+        except SystemExit as error:
+            failures.append(str(error).removeprefix("ERROR: "))
+    if len(set(paths.values())) != len(paths):
+        failures.append("runtime, secret, backup, and log roots must be distinct")
+
+    for name, path in paths.items():
+        if not path.is_dir():
+            failures.append(f"{name} directory is missing: {path}")
+            continue
+        mode = path.stat().st_mode & 0o777
+        if name == "SAFEPLANE_SECRET_ROOT" and mode & 0o077:
+            failures.append(f"secret root is too permissive: {oct(mode)}")
+
+    secret_root = paths.get("SAFEPLANE_SECRET_ROOT")
+    if secret_root:
+        for name in REQUIRED_SECRETS:
+            path = secret_root / name
+            if not path.is_file() or path.stat().st_size == 0:
+                failures.append(f"required secret is missing or empty: {name}")
+            elif path.stat().st_mode & 0o077:
+                failures.append(f"secret is too permissive: {name}")
+
+    usage = shutil.disk_usage(paths.get("SAFEPLANE_HOME", ROOT))
+    if usage.free < 5 * 1024**3:
+        warnings.append("less than 5 GiB free space remains")
+
+    timedatectl = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], check=False, capture=True)
+    if timedatectl.returncode or timedatectl.stdout.strip().lower() != "yes":
+        warnings.append("NTP synchronization could not be confirmed")
+
+    rendered = compose("config", "--format", "json", capture=True, check=False)
+    if rendered.returncode:
+        failures.append("production Compose configuration does not render")
+    else:
+        config = json.loads(rendered.stdout)
+        for name, service in config.get("services", {}).items():
+            if service.get("ports"):
+                failures.append(f"service publishes a host port: {name}")
+            if service.get("logging", {}).get("driver") != "json-file":
+                failures.append(f"service lacks production json-file logging: {name}")
+
+    print(f"Source revision: {git_revision()}")
+    for warning in warnings:
+        print(f"WARNING: {warning}")
+    if failures:
+        for failure in failures:
+            print(f"ERROR: {failure}", file=sys.stderr)
+        raise SystemExit(1)
+    print("OK: Safeplane VPS preflight passed")
+
+
+def secrets(args: argparse.Namespace) -> None:
+    command = [str(ROOT / "scripts" / "safeplane-secret"), args.action]
+    if args.name:
+        command.append(args.name)
+    run(command)
+
+
+def config(_: argparse.Namespace) -> None:
+    compose("config", "--quiet")
+    output = compose("config", "--format", "json", capture=True).stdout
+    rendered = json.loads(output)
+    exposed = [name for name, service in rendered.get("services", {}).items() if service.get("ports")]
+    if exposed:
+        raise SystemExit(f"ERROR: host ports are published by: {', '.join(exposed)}")
+    print(f"Revision: {git_revision()}")
+    print("OK: production Compose renders with no published application port")
+
+
+def start(args: argparse.Namespace) -> None:
+    profile = active_profile()
+    previous = recorded_profile()
+    if previous and previous != profile:
+        print(f"Switching VPS profile: {previous} -> {profile}")
+        compose("down", "--remove-orphans", check=False)
+
+    result = compose("up", "-d", "--build", "--remove-orphans", check=False)
+    if result.returncode:
+        print(
+            "WARNING: Compose reconciliation failed; removing stale project containers and retrying once",
+            file=sys.stderr,
+        )
+        compose("down", "--remove-orphans", check=False)
+        compose("up", "-d", "--build", "--remove-orphans")
+
+    wait_healthy(args.timeout)
+    if published_ports():
+        raise SystemExit("ERROR: Safeplane unexpectedly publishes a host port")
+    record_profile(profile)
+    print("OK: Safeplane VPS stack is healthy and portless")
+
+
+def stop(_: argparse.Namespace) -> None:
+    compose("stop")
+    print("OK: Safeplane VPS stack stopped; persistent state preserved")
+
+
+def restart(args: argparse.Namespace) -> None:
+    compose("restart")
+    wait_healthy(args.timeout)
+    print("OK: Safeplane VPS stack restarted and healthy")
+
+
+def status(args: argparse.Namespace) -> None:
+    services = services_for_profile()
+    rows: list[dict[str, str]] = []
+    for service in services:
+        state, health, restart_policy = inspect_service(service)
+        rows.append(
+            {
+                "service": service,
+                "state": state,
+                "health": health,
+                "restart": restart_policy or "none",
+            }
+        )
+
+    expected = len(rows)
+    present = sum(row["state"] != "missing" for row in rows)
+    running = sum(row["state"] == "running" for row in rows)
+    healthy = sum(row["health"] == "healthy" for row in rows)
+    no_healthcheck = sum(row["state"] == "running" and row["health"] == "none" for row in rows)
+    unhealthy = sum(row["health"] not in {"healthy", "none"} for row in rows)
+    missing = sum(row["state"] == "missing" for row in rows)
+    ports = published_ports()
+    ready = all(service_ready(row["state"], row["health"]) for row in rows) and not ports
+
+    summary = {
+        "revision": git_revision(),
+        "profile": active_profile(),
+        "expected": expected,
+        "present": present,
+        "running": running,
+        "healthy": healthy,
+        "no_healthcheck": no_healthcheck,
+        "unhealthy": unhealthy,
+        "missing": missing,
+        "portless": not ports,
+        "ready": ready,
+        "services": rows,
+        "published_ports": ports,
+    }
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print(f"Revision: {summary['revision']}")
+        print(f"Profile: {summary['profile']}")
+        for row in rows:
+            health = "no-healthcheck" if row["health"] == "none" and row["state"] == "running" else row["health"]
+            print(
+                f"{row['service']:24} state={row['state']:10} "
+                f"health={health:14} restart={row['restart']}"
+            )
+        print(
+            "Services: "
+            f"expected={expected} present={present} running={running} "
+            f"healthy={healthy} no-healthcheck={no_healthcheck} "
+            f"unhealthy={unhealthy} missing={missing}"
+        )
+        if ports:
+            print("Published ports:")
+            for line in ports:
+                print(f"- {line}")
+        else:
+            print("Published Safeplane application ports: none")
+        print(f"Overall status: {'READY' if ready else 'NOT READY'}")
+
+    if not ready:
+        raise SystemExit(1)
+
+
+def logs(args: argparse.Namespace) -> None:
+    command = ["logs", "--tail", str(args.tail)]
+    if args.follow:
+        command.append("--follow")
+    command.extend(args.services)
+    compose(*command)
+
+
+def backup(args: argparse.Namespace) -> None:
+    runtime = env_path("SAFEPLANE_HOME")
+    backup_root = env_path("SAFEPLANE_BACKUP_ROOT")
+    backup_root.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    revision = git_revision()
+    name = args.name or f"safeplane-{timestamp}-{revision[:12]}"
+    archive = backup_root / f"{name}.tar.gz"
+    manifest = backup_root / f"{name}.manifest.json"
+    checksum = backup_root / f"{name}.sha256"
+    if any(path.exists() for path in (archive, manifest, checksum)):
+        raise SystemExit(f"ERROR: backup already exists: {name}")
+
+    with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as handle:
+        for member in BACKUP_MEMBERS:
+            path = runtime / member
+            if path.exists():
+                handle.add(path, arcname=member, recursive=True)
+    archive.chmod(0o600)
+    digest = sha256(archive)
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "source_revision": revision,
+                "runtime_root": str(runtime),
+                "archive": archive.name,
+                "sha256": digest,
+                "included_roots": list(BACKUP_MEMBERS),
+                "excluded": ["secrets", "workspaces", "git-fixtures", "mock-github", "evals"],
+            },
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    manifest.chmod(0o600)
+    checksum.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+    checksum.chmod(0o600)
+    print(f"Backup: {archive}")
+    print(f"Manifest: {manifest}")
+    print(f"SHA-256: {digest}")
+    print("OK: backup created without secret or workspace roots")
+
+
+def safe_members(handle: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    members = handle.getmembers()
+    for member in members:
+        path = Path(member.name)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit(f"ERROR: unsafe archive member: {member.name}")
+        if not path.parts or path.parts[0] not in BACKUP_MEMBERS:
+            raise SystemExit(f"ERROR: unexpected archive root: {member.name}")
+        if member.issym() or member.islnk():
+            raise SystemExit(f"ERROR: links are not allowed in restore archives: {member.name}")
+    return members
+
+
+def restore(args: argparse.Namespace) -> None:
+    if args.confirm != "RESTORE":
+        raise SystemExit("ERROR: restore requires --confirm RESTORE")
+    archive = Path(args.archive).expanduser().resolve(strict=True)
+    checksum_path = archive.with_suffix("").with_suffix(".sha256")
+    if not checksum_path.is_file():
+        raise SystemExit(f"ERROR: checksum file is missing: {checksum_path}")
+    expected = checksum_path.read_text(encoding="utf-8").split()[0]
+    actual = sha256(archive)
+    if actual != expected:
+        raise SystemExit("ERROR: backup checksum does not match")
+
+    runtime = env_path("SAFEPLANE_HOME")
+    compose("stop", check=False)
+    safety = runtime.parent / f"{runtime.name}.pre-restore-{dt.datetime.now().strftime('%Y%m%d%H%M%S')}"
+    if safety.exists():
+        raise SystemExit(f"ERROR: safety path already exists: {safety}")
+    runtime.rename(safety)
+    runtime.mkdir(parents=True, exist_ok=False)
+    try:
+        with tarfile.open(archive, "r:gz") as handle:
+            members = safe_members(handle)
+            handle.extractall(runtime, members=members, filter="data")
+    except Exception:
+        shutil.rmtree(runtime, ignore_errors=True)
+        safety.rename(runtime)
+        raise
+    print(f"Previous runtime preserved at: {safety}")
+    print("Run: sudo -E ./scripts/prepare-vps-layout")
+    print("Then run: ./scripts/safeplane-vps start")
+    print("OK: backup restored and previous runtime preserved")
+
+
+def update(args: argparse.Namespace) -> None:
+    require_clean_checkout()
+    previous = git_revision()
+    deployment = env_path("SAFEPLANE_HOME") / "deployment"
+    deployment.mkdir(parents=True, exist_ok=True)
+    run(["git", "fetch", "--prune", "origin"])
+    run(["git", "pull", "--ff-only", "origin", args.branch])
+    current = git_revision()
+    (deployment / "previous_revision").write_text(previous + "\n", encoding="utf-8")
+    (deployment / "current_revision").write_text(current + "\n", encoding="utf-8")
+    start(argparse.Namespace(timeout=args.timeout))
+    print(f"Updated: {previous} -> {current}")
+
+
+def rollback(args: argparse.Namespace) -> None:
+    if args.confirm != "ROLLBACK":
+        raise SystemExit("ERROR: rollback requires --confirm ROLLBACK")
+    require_clean_checkout()
+    deployment = env_path("SAFEPLANE_HOME") / "deployment"
+    revision = args.revision
+    if not revision:
+        path = deployment / "previous_revision"
+        if not path.is_file():
+            raise SystemExit("ERROR: no previous revision is recorded")
+        revision = path.read_text(encoding="utf-8").strip()
+    run(["git", "cat-file", "-e", f"{revision}^{{commit}}"])
+    current = git_revision()
+    run(["git", "reset", "--hard", revision])
+    (deployment / "rolled_back_from").write_text(current + "\n", encoding="utf-8")
+    (deployment / "current_revision").write_text(revision + "\n", encoding="utf-8")
+    start(argparse.Namespace(timeout=args.timeout))
+    print(f"Rolled back: {current} -> {revision}")
+
+
+def cleanup(args: argparse.Namespace) -> None:
+    command = [str(ROOT / "scripts" / "safeplane"), "maintenance", "clean", "--older-than", args.older_than]
+    if args.dry_run:
+        command.append("--dry-run")
+    run(command)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description="Operate the portless Safeplane VPS deployment.")
+    sub = result.add_subparsers(dest="command", required=True)
+    sub.add_parser("preflight").set_defaults(func=preflight)
+    secret = sub.add_parser("secrets")
+    secret.add_argument("action", choices=("set", "list"))
+    secret.add_argument("name", nargs="?")
+    secret.set_defaults(func=secrets)
+    sub.add_parser("config").set_defaults(func=config)
+    for name, func in (("start", start), ("restart", restart)):
+        item = sub.add_parser(name)
+        item.add_argument("--timeout", type=int, default=300)
+        item.set_defaults(func=func)
+    sub.add_parser("stop").set_defaults(func=stop)
+    item = sub.add_parser("status")
+    item.add_argument("--json", action="store_true")
+    item.set_defaults(func=status)
+    log = sub.add_parser("logs")
+    log.add_argument("services", nargs="*", default=[])
+    log.add_argument("--tail", type=int, default=200)
+    log.add_argument("--follow", action="store_true")
+    log.set_defaults(func=logs)
+    item = sub.add_parser("backup")
+    item.add_argument("--name")
+    item.set_defaults(func=backup)
+    item = sub.add_parser("restore")
+    item.add_argument("--archive", required=True)
+    item.add_argument("--confirm", required=True)
+    item.set_defaults(func=restore)
+    item = sub.add_parser("update")
+    item.add_argument("--branch", default="main")
+    item.add_argument("--timeout", type=int, default=300)
+    item.set_defaults(func=update)
+    item = sub.add_parser("rollback")
+    item.add_argument("--revision")
+    item.add_argument("--confirm", required=True)
+    item.add_argument("--timeout", type=int, default=300)
+    item.set_defaults(func=rollback)
+    item = sub.add_parser("cleanup")
+    item.add_argument("--older-than", default="30d")
+    item.add_argument("--dry-run", action="store_true")
+    item.set_defaults(func=cleanup)
+    return result
+
+
+def main() -> None:
+    args = parser().parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted; detached Safeplane containers continue running.", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+if [[ "${SAFEPLANE_CONFIRM_REAL_GITHUB_CLONE:-}" != "yes" ]]; then
+  echo "Refusing to run: this is a manual GitHub repository clone smoke." >&2
+  echo "Set SAFEPLANE_CONFIRM_REAL_GITHUB_CLONE=yes and SAFEPLANE_REAL_REPOSITORY_PROFILE=<profile>." >&2
+  exit 2
+fi
+
+PROFILE="${SAFEPLANE_REAL_REPOSITORY_PROFILE:-}"
+[[ -n "$PROFILE" ]] || { echo "SAFEPLANE_REAL_REPOSITORY_PROFILE is required" >&2; exit 2; }
+HOME_DIR="${SAFEPLANE_HOME:-$HOME/.safeplane}"
+SECRET="$HOME_DIR/secrets/github_token"
+CONFIG="$HOME_DIR/config/repositories.yaml"
+[[ -s "$SECRET" ]] || { echo "Missing GitHub secret: $SECRET" >&2; exit 2; }
+[[ -s "$CONFIG" ]] || { echo "Missing repository config: $CONFIG" >&2; exit 2; }
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-github-fake"
+"$COMPOSE" up -d --build --force-recreate \
+  model-gateway calendar-task-mcp notification-task-mcp scheduler \
+  dev-workspace-mcp dev-workspace-apply-mcp harness
+
+if ! "$COMPOSE" exec -T harness test -s /run/secrets/github_token; then
+  echo "GitHub secret is not mounted into harness" >&2
+  exit 1
+fi
+if "$COMPOSE" exec -T model-gateway test -e /run/secrets/github_token; then
+  echo "GitHub secret leaked into model-gateway" >&2
+  exit 1
+fi
+if "$COMPOSE" exec -T dev-workspace-mcp test -e /run/secrets/github_token; then
+  echo "GitHub secret leaked into dev-workspace-mcp" >&2
+  exit 1
+fi
+
+response="$(python3 - "$PROFILE" <<'PY'
+import json, sys
+print(json.dumps({
+    "connector": "cli",
+    "repository_profile": sys.argv[1],
+    "message": "Validate secure external repository preparation in fake model mode",
+}))
+PY
+)"
+result="$(curl -fsS -X POST "${SAFEPLANE_HARNESS_URL:-http://127.0.0.1:8787}/connector/develop" \
+  -H 'Content-Type: application/json' -d "$response")"
+run_id="$(python3 - "$result" <<'PY'
+import json, sys
+value=json.loads(sys.argv[1])
+assert value["status"] == "completed", value
+print(value["run_id"])
+PY
+)"
+
+manifest="$HOME_DIR/workspaces/$run_id/workspace.json"
+[[ -f "$manifest" ]]
+repo="$HOME_DIR/workspaces/$run_id/repo"
+[[ -d "$repo/.git" ]]
+remote="$(git -C "$repo" remote get-url origin)"
+[[ "$remote" != *"@"* ]]
+[[ "$remote" != *"x-access-token"* ]]
+
+token="$(tr -d '\r\n' < "$SECRET")"
+if [[ -n "$token" ]] && grep -RFl --exclude='github_token' -- "$token" \
+  "$HOME_DIR/workspaces/$run_id" "$HOME_DIR/traces" "$HOME_DIR/runs" >/tmp/safeplane-repository-workspace-token-leak.txt 2>/dev/null; then
+  echo "GitHub token was found in persisted evidence:" >&2
+  cat /tmp/safeplane-repository-workspace-token-leak.txt >&2
+  rm -f /tmp/safeplane-repository-workspace-token-leak.txt
+  exit 1
+fi
+rm -f /tmp/safeplane-repository-workspace-token-leak.txt
+
+echo "run: $run_id"
+echo "remote: $remote"
+echo "OK: real GitHub clone completed without persisted credentials"

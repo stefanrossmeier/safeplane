@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+def safeplane_home() -> Path:
+    return Path(os.environ.get("SAFEPLANE_HOME", str(Path.home() / ".safeplane"))).expanduser().resolve()
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def latest_run_id(home: Path) -> str:
+    runs_dir = home / "runs"
+    candidates: list[tuple[str, int, str]] = []
+    for path in runs_dir.glob("run_*.json"):
+        try:
+            data = read_json(path)
+        except Exception:
+            continue
+        created = str(data.get("created_at") or data.get("started_at") or "")
+        candidates.append((created, path.stat().st_mtime_ns, str(data.get("run_id") or path.stem)))
+    if not candidates:
+        raise SystemExit(f"No Safeplane run records found under {runs_dir}")
+    candidates.sort()
+    return candidates[-1][2]
+
+
+def resolve_trace_path(home: Path, raw: object) -> Path | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    path = Path(raw)
+    if path.is_absolute():
+        try:
+            return home / path.relative_to("/data/safeplane")
+        except ValueError:
+            return path
+    return home / path
+
+
+def copy_tree(source: Path, destination: Path) -> None:
+    if not source.exists():
+        return
+    source = source.resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in sorted(source.rglob("*")):
+        if item.is_symlink():
+            continue
+        relative = item.relative_to(source)
+        target = destination / relative
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif item.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_manifest(root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file() and not item.is_symlink()):
+        rows.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "bytes": path.stat().st_size,
+                "sha256": sha256(path),
+            }
+        )
+    return rows
+
+
+def write_summary(path: Path, run: dict[str, Any], included: list[str]) -> None:
+    pipeline = run.get("developer_pipeline") or {}
+    remote = run.get("remote_write") or pipeline.get("remote_write") or {}
+    lines = [
+        f"# Safeplane run evidence: {run.get('run_id')}",
+        "",
+        f"- Status: `{run.get('status')}`",
+        f"- Workflow: `{run.get('workflow_id')}` / `{run.get('entrypoint')}`",
+        f"- Repository profile: `{run.get('repository_profile') or 'none'}`",
+        f"- Pipeline state: `{pipeline.get('current_state') or 'n/a'}`",
+        f"- Review verdict: `{pipeline.get('review_verdict') or 'n/a'}`",
+        f"- Plan alignment: `{pipeline.get('review_plan_alignment') or 'n/a'}`",
+        f"- Checks: `{(pipeline.get('check_summary') or {}).get('status') or 'n/a'}`",
+        f"- Draft PR: `{remote.get('pull_request_url') or pipeline.get('pull_request_url') or 'none'}`",
+        "",
+        "## Included paths",
+        "",
+    ]
+    lines.extend(f"- `{item}`" for item in included)
+    lines.extend(
+        [
+            "",
+            "This bundle is local operator evidence. It intentionally excludes Safeplane secret directories and target repository `.git` internals.",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Collect one Safeplane run's operator evidence.")
+    parser.add_argument("run", nargs="?", default="latest", help="run id or 'latest'")
+    parser.add_argument("--output", help="destination directory")
+    parser.add_argument("--force", action="store_true", help="replace an existing destination")
+    parser.add_argument("--json", action="store_true", help="print result as JSON")
+    args = parser.parse_args()
+
+    home = safeplane_home()
+    run_id = latest_run_id(home) if args.run == "latest" else args.run
+    if not run_id.startswith("run_") or "/" in run_id or ".." in run_id:
+        raise SystemExit(f"Invalid run id: {run_id}")
+
+    run_path = home / "runs" / f"{run_id}.json"
+    if not run_path.is_file():
+        raise SystemExit(f"Run record not found: {run_path}")
+    run = read_json(run_path)
+
+    destination = Path(args.output).expanduser() if args.output else home / "evidence-bundles" / run_id
+    destination = destination.resolve()
+    if destination.exists():
+        if not args.force:
+            raise SystemExit(f"Evidence destination already exists: {destination}; use --force")
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+
+    shutil.copy2(run_path, destination / "run.json")
+    included = ["run.json"]
+
+    run_root = home / "workspaces" / run_id
+    for name in ("pipeline", "evidence", "remote-approvals"):
+        source = run_root / name
+        if source.exists():
+            copy_tree(source, destination / name)
+            included.append(name)
+
+    trace = resolve_trace_path(home, run.get("trace_path"))
+    if trace and trace.exists():
+        copy_tree(trace, destination / "trace")
+        included.append("trace")
+
+    write_summary(destination / "SUMMARY.md", run, included)
+    manifest = {
+        "version": 1,
+        "run_id": run_id,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "safeplane_home": str(home),
+        "included": included,
+        "files": build_manifest(destination),
+    }
+    (destination / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    result = {"run_id": run_id, "output": str(destination), "files": len(manifest["files"])}
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Safeplane evidence collected: {destination}")
+        print(f"Run: {run_id}")
+        print(f"Files: {result['files']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

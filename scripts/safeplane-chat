@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SAFEPLANE_HARNESS_URL="${SAFEPLANE_HARNESS_URL:-http://localhost:8787}"
+
+usage() {
+  echo "Usage:"
+  echo "  safeplane workflows"
+  echo "  safeplane runs"
+  echo "  safeplane status <run-id>"
+  echo "  safeplane approve-patch <run-id> <proposal-id>"
+  echo "  safeplane approve-pr <run-id>"
+  echo "  safeplane chat \"message\""
+  echo "  safeplane chat --session <session-id-or-display-id> \"message\""
+  echo "  safeplane assistant \"message\""
+  echo "  safeplane assistant --session <session-id-or-display-id> \"message\""
+  echo "  safeplane developer \"message\""
+  echo "  safeplane developer --session <session-id-or-display-id> \"message\""
+  echo "  safeplane develop [--repo <profile>] \"task\""
+  echo "  safeplane develop [--repo <profile>] --session <session-id-or-display-id> \"task\""
+  echo "  safeplane run <entrypoint> \"message\""
+  echo "  safeplane run <entrypoint> --session <session-id-or-display-id> \"message\""
+}
+
+json_escape() {
+  python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))'
+}
+
+if [ "${1:-}" = "" ]; then
+  usage
+  exit 1
+fi
+
+COMMAND="$1"
+shift
+
+call_connector() {
+  local entrypoint="$1"
+  shift
+
+  SESSION_REF=""
+  REPOSITORY_PROFILE=""
+
+  while [ "${1:-}" != "" ]; do
+    case "$1" in
+      --session)
+        shift
+        if [ "${1:-}" = "" ]; then
+          usage
+          exit 1
+        fi
+        SESSION_REF="$1"
+        shift
+        ;;
+      --repo)
+        shift
+        if [ "${1:-}" = "" ]; then
+          usage
+          exit 1
+        fi
+        REPOSITORY_PROFILE="$1"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  MESSAGE="$*"
+
+  if [ -z "$MESSAGE" ]; then
+    usage
+    exit 1
+  fi
+
+  ESCAPED_MESSAGE="$(printf "%s" "$MESSAGE" | json_escape)"
+
+  if [ -n "$REPOSITORY_PROFILE" ] && [ "$entrypoint" != "develop" ]; then
+    echo "--repo is only valid for the develop entrypoint" >&2
+    exit 1
+  fi
+
+  PAYLOAD="{\"connector\":\"cli\",\"message\":$ESCAPED_MESSAGE"
+  if [ -n "$SESSION_REF" ]; then
+    ESCAPED_SESSION_REF="$(printf "%s" "$SESSION_REF" | json_escape)"
+    PAYLOAD="$PAYLOAD,\"session_ref\":$ESCAPED_SESSION_REF"
+  fi
+  if [ -n "$REPOSITORY_PROFILE" ]; then
+    ESCAPED_REPOSITORY_PROFILE="$(printf "%s" "$REPOSITORY_PROFILE" | json_escape)"
+    PAYLOAD="$PAYLOAD,\"repository_profile\":$ESCAPED_REPOSITORY_PROFILE"
+  fi
+  PAYLOAD="$PAYLOAD}"
+
+  RESPONSE_FILE="$(mktemp)"
+  HTTP_STATUS="$(
+    curl -sS \
+      -o "$RESPONSE_FILE" \
+      -w "%{http_code}" \
+      -X POST "$SAFEPLANE_HARNESS_URL/connector/$entrypoint" \
+      -H "Content-Type: application/json" \
+      -d "$PAYLOAD"
+  )"
+
+  RESPONSE="$(cat "$RESPONSE_FILE")"
+  rm -f "$RESPONSE_FILE"
+
+  python3 - "$HTTP_STATUS" "$RESPONSE" <<'PY'
+import json
+import sys
+
+http_status = int(sys.argv[1])
+raw = sys.argv[2]
+
+try:
+    response = json.loads(raw)
+except Exception:
+    print(raw, file=sys.stderr)
+    sys.exit(1)
+
+if http_status >= 400:
+    detail = response.get("detail")
+    if detail:
+        print(f"Error: {detail}", file=sys.stderr)
+    else:
+        print(json.dumps(response, indent=2, ensure_ascii=False), file=sys.stderr)
+    sys.exit(1)
+
+if response.get("status") != "completed":
+    print(json.dumps(response, indent=2, ensure_ascii=False), file=sys.stderr)
+    sys.exit(1)
+
+print(response.get("final_message") or "")
+print()
+print(f"session: {response['session_display_id']}")
+print(f"turn: {response['turn']}")
+print(f"run: {response['run_id']}")
+print(f"status: {response['status']}")
+print(f"trace: {response['trace_path']}")
+PY
+}
+
+case "$COMMAND" in
+  workflows)
+    RESPONSE_FILE="$(mktemp)"
+    HTTP_STATUS="$(
+      curl -sS \
+        -o "$RESPONSE_FILE" \
+        -w "%{http_code}" \
+        "$SAFEPLANE_HARNESS_URL/workflows"
+    )"
+
+    RESPONSE="$(cat "$RESPONSE_FILE")"
+    rm -f "$RESPONSE_FILE"
+
+    python3 - "$HTTP_STATUS" "$RESPONSE" <<'PY'
+import json
+import sys
+
+http_status = int(sys.argv[1])
+raw = sys.argv[2]
+
+try:
+    response = json.loads(raw)
+except Exception:
+    print(raw, file=sys.stderr)
+    sys.exit(1)
+
+if http_status >= 400:
+    print(f"Error: {response.get('detail', raw)}", file=sys.stderr)
+    sys.exit(1)
+
+for workflow in response.get("workflows", []):
+    status = "enabled" if workflow.get("enabled") else "disabled"
+    print(f"{workflow['entrypoint']}: {workflow['workflow_id']} {workflow['version']} ({status})")
+    print(f"  {workflow['description']}")
+PY
+    ;;
+
+  runs)
+    RESPONSE_FILE="$(mktemp)"
+    HTTP_STATUS="$(
+      curl -sS \
+        -o "$RESPONSE_FILE" \
+        -w "%{http_code}" \
+        "$SAFEPLANE_HARNESS_URL/runs"
+    )"
+
+    RESPONSE="$(cat "$RESPONSE_FILE")"
+    rm -f "$RESPONSE_FILE"
+
+    python3 - "$HTTP_STATUS" "$RESPONSE" <<'PY'
+import json
+import sys
+
+http_status = int(sys.argv[1])
+raw = sys.argv[2]
+
+try:
+    response = json.loads(raw)
+except Exception:
+    print(raw, file=sys.stderr)
+    sys.exit(1)
+
+if http_status >= 400:
+    print(f"Error: {response.get('detail', raw)}", file=sys.stderr)
+    sys.exit(1)
+
+for run in response.get("runs", []):
+    print(
+        f"{run['run_id']} {run['status']} "
+        f"{run['workflow_id']} session={run['session_display_id']} turn={run['turn']}"
+    )
+PY
+    ;;
+
+  approve-patch)
+    if [ "${1:-}" = "" ] || [ "${2:-}" = "" ]; then
+      usage
+      exit 1
+    fi
+
+    RUN_ID="$1"
+    PROPOSAL_ID="$2"
+
+    RESPONSE_FILE="$(mktemp)"
+    HTTP_STATUS="$(
+      curl -sS \
+        -o "$RESPONSE_FILE" \
+        -w "%{http_code}" \
+        -X POST "$SAFEPLANE_HARNESS_URL/runs/$RUN_ID/patches/$PROPOSAL_ID/approve" \
+        -H "Content-Type: application/json" \
+        -d '{"approved":true}'
+    )"
+
+    RESPONSE="$(cat "$RESPONSE_FILE")"
+    rm -f "$RESPONSE_FILE"
+
+    python3 - "$HTTP_STATUS" "$RESPONSE" <<'PY'
+import json
+import sys
+
+http_status = int(sys.argv[1])
+raw = sys.argv[2]
+
+try:
+    response = json.loads(raw)
+except Exception:
+    print(raw, file=sys.stderr)
+    sys.exit(1)
+
+if http_status >= 400:
+    print(f"Error: {response.get('detail', raw)}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"approval: {response['approval_id']}")
+print(f"proposal: {response['proposal_id']}")
+print(f"run: {response['run_id']}")
+print(f"status: {response['status']}")
+print(f"workspace: {response['workspace_ref']}")
+if response.get("evidence_ref"):
+    print(f"evidence: {response['evidence_ref']}")
+print("changed files:")
+for item in response.get("changed_files", []):
+    print(f"  {item['operation']}: {item['path']}")
+PY
+    ;;
+
+  approve-pr)
+    if [ "${1:-}" = "" ]; then
+      usage
+      exit 1
+    fi
+
+    RUN_ID="$1"
+    RESPONSE_FILE="$(mktemp)"
+    HTTP_STATUS="$(
+      curl -sS \
+        -o "$RESPONSE_FILE" \
+        -w "%{http_code}" \
+        -X POST "$SAFEPLANE_HARNESS_URL/runs/$RUN_ID/remote/approve" \
+        -H "Content-Type: application/json" \
+        -d '{"approved":true,"connector":"cli"}'
+    )"
+
+    RESPONSE="$(cat "$RESPONSE_FILE")"
+    rm -f "$RESPONSE_FILE"
+
+    python3 - "$HTTP_STATUS" "$RESPONSE" <<'PY'
+import json
+import sys
+
+http_status = int(sys.argv[1])
+raw = sys.argv[2]
+try:
+    response = json.loads(raw)
+except Exception:
+    print(raw, file=sys.stderr)
+    sys.exit(1)
+
+if http_status >= 400:
+    print(f"Error: {response.get('detail', raw)}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"approval: {response['approval_id']}")
+print(f"run: {response['run_id']}")
+print(f"status: {response['status']}")
+print(f"branch: {response['branch_name']}")
+print(f"commit: {response['commit_sha']}")
+print(f"draft PR: {response['pull_request_url']}")
+print(f"branch reused: {str(response['branch_reused']).lower()}")
+print(f"PR reused: {str(response['pull_request_reused']).lower()}")
+print(f"evidence: {response['evidence_ref']}")
+PY
+    ;;
+
+  status)
+    if [ "${1:-}" = "" ]; then
+      usage
+      exit 1
+    fi
+
+    RUN_ID="$1"
+
+    RESPONSE_FILE="$(mktemp)"
+    HTTP_STATUS="$(
+      curl -sS \
+        -o "$RESPONSE_FILE" \
+        -w "%{http_code}" \
+        "$SAFEPLANE_HARNESS_URL/runs/$RUN_ID"
+    )"
+
+    RESPONSE="$(cat "$RESPONSE_FILE")"
+    rm -f "$RESPONSE_FILE"
+
+    python3 - "$HTTP_STATUS" "$RESPONSE" <<'PY'
+import json
+import sys
+
+http_status = int(sys.argv[1])
+raw = sys.argv[2]
+
+try:
+    run = json.loads(raw)
+except Exception:
+    print(raw, file=sys.stderr)
+    sys.exit(1)
+
+if http_status >= 400:
+    print(f"Error: {run.get('detail', raw)}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"run: {run['run_id']}")
+print(f"status: {run['status']}")
+print(f"session: {run['session_display_id']}")
+print(f"turn: {run['turn']}")
+print(f"workflow: {run['workflow_id']}")
+print(f"entrypoint: {run['entrypoint']}")
+if run.get("repository_profile"):
+    print(f"repository profile: {run['repository_profile']}")
+print(f"trace: {run['trace_path']}")
+
+pipeline = run.get("developer_pipeline") or {}
+if pipeline:
+    print(f"pipeline state: {pipeline.get('current_state')}")
+    completed = pipeline.get("completed_stages") or []
+    if completed:
+        print(f"completed stages: {', '.join(completed)}")
+    check_summary = pipeline.get("check_summary") or {}
+    if check_summary:
+        print(f"checks: {check_summary.get('status')}")
+    if pipeline.get("review_verdict"):
+        print(f"review: {pipeline['review_verdict']}")
+    print(
+        "remote approval: "
+        + ("available" if pipeline.get("remote_approval_possible") else "not available")
+    )
+    binding = pipeline.get("remote_approval_binding") or {}
+    if binding:
+        print(f"planned branch: {binding.get('branch_name')}")
+        print(f"approved workspace: {binding.get('workspace_tree_sha256')}")
+    remote_write = pipeline.get("remote_write") or run.get("remote_write") or {}
+    if remote_write:
+        print(f"remote branch: {remote_write.get('branch_name')}")
+        print(f"remote commit: {remote_write.get('commit_sha')}")
+        print(f"draft PR: {remote_write.get('pull_request_url')}")
+    agent_runs = pipeline.get("agent_runs") or []
+    if agent_runs:
+        print("models:")
+        for item in agent_runs:
+            details = [
+                f"duration={item.get('duration_ms', 0)}ms",
+                f"retries={item.get('retry_count', 0)}",
+            ]
+            if item.get("total_tokens") is not None:
+                details.append(f"tokens={item.get('total_tokens')}")
+            if item.get("cost") is not None:
+                details.append(f"cost={item.get('cost')}")
+            print(
+                f"  {item.get('stage_id')}: {item.get('model_profile')} -> "
+                f"{item.get('actual_provider') or '?'} / {item.get('actual_model') or '?'} "
+                f"({' '.join(details)})"
+            )
+
+if run.get("final_message"):
+    print()
+    print(run["final_message"])
+
+if run.get("error"):
+    print()
+    print(json.dumps(run["error"], indent=2, ensure_ascii=False))
+PY
+    ;;
+
+  run)
+    if [ "${1:-}" = "" ]; then
+      usage
+      exit 1
+    fi
+    ENTRYPOINT="$1"
+    shift
+    call_connector "$ENTRYPOINT" "$@"
+    ;;
+
+  chat|assistant|developer|develop)
+    call_connector "$COMMAND" "$@"
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac

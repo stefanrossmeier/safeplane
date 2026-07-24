@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "services/harness/src"))
+
+from harness.calendar_store import (  # noqa: E402
+    CalendarNotFoundError,
+    CalendarValidationError,
+    cancel_calendar_event,
+    calendar_store_report,
+    cleanup_calendar_store,
+    create_calendar_event,
+    create_snapshot,
+    get_calendar_event,
+    list_events_for_day,
+    list_events_for_week,
+    rebuild_index,
+    reset_calendar_store,
+)
+
+
+def safeplane_home() -> Path:
+    return Path(os.environ.get("SAFEPLANE_HOME", str(Path.home() / ".safeplane"))).expanduser()
+
+
+def print_json(data: object) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def print_event_line(event: dict) -> None:
+    print(
+        f"{event['id']} {event['status']} "
+        f"{event['start']} -> {event['end']} "
+        f"{event['title']}"
+    )
+
+
+def cmd_create(args: argparse.Namespace) -> int:
+    event = create_calendar_event(
+        safeplane_home=safeplane_home(),
+        title=args.title,
+        start=args.start,
+        end=args.end,
+        timezone_name=args.timezone,
+        description=args.description or "",
+    )
+
+    if args.json:
+        print_json(event)
+    else:
+        print_event_line(event)
+
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    if args.day:
+        events = list_events_for_day(
+            safeplane_home=safeplane_home(),
+            day=args.day,
+            timezone_name=args.timezone,
+            include_cancelled=args.include_cancelled,
+        )
+    else:
+        events = list_events_for_week(
+            safeplane_home=safeplane_home(),
+            week=args.week,
+            timezone_name=args.timezone,
+            include_cancelled=args.include_cancelled,
+        )
+
+    if args.json:
+        print_json({"events": events})
+    else:
+        for event in events:
+            print_event_line(event)
+
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    event = get_calendar_event(
+        safeplane_home=safeplane_home(),
+        event_id=args.event_id,
+    )
+
+    if args.json:
+        print_json(event)
+    else:
+        print_event_line(event)
+        if event.get("description"):
+            print(event["description"])
+
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    event = cancel_calendar_event(
+        safeplane_home=safeplane_home(),
+        event_id=args.event_id,
+    )
+
+    if args.json:
+        print_json(event)
+    else:
+        print_event_line(event)
+
+    return 0
+
+
+def cmd_rebuild_index(args: argparse.Namespace) -> int:
+    index = rebuild_index(safeplane_home())
+
+    if args.json:
+        print_json(index)
+    else:
+        print(f"rebuilt index: {index['event_count']} events")
+
+    return 0
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    snapshot_path = create_snapshot(safeplane_home())
+
+    if args.json:
+        print_json({"snapshot_path": str(snapshot_path)})
+    else:
+        print(f"snapshot: {snapshot_path}")
+
+    return 0
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        report = calendar_store_report(safeplane_home())
+        report["dry_run"] = True
+        report["would"] = [
+            "validate calendar event log",
+            "rebuild materialized index",
+            "create calendar snapshot",
+        ]
+
+        if args.json:
+            print_json(report)
+        else:
+            print(f"calendar root: {report['root']}")
+            print(f"events: {report['event_count']}")
+            print("dry-run: would rebuild index and create snapshot")
+
+        return 0
+
+    result = cleanup_calendar_store(safeplane_home())
+
+    if args.json:
+        print_json(result)
+    else:
+        print(f"cleanup: {result['status']}")
+        print(f"events: {result['event_count']}")
+        print(f"snapshot: {result['snapshot_path']}")
+
+    return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        report = calendar_store_report(safeplane_home())
+        report["dry_run"] = True
+        report["would"] = [
+            "backup current calendar event log and index",
+            "truncate events.jsonl",
+            "write empty index.json",
+            "keep backups and snapshots",
+        ]
+
+        if args.json:
+            print_json(report)
+        else:
+            print(f"calendar root: {report['root']}")
+            print(f"events: {report['event_count']}")
+            print("dry-run: would backup and reset calendar data")
+
+        return 0
+
+    if args.confirm != "RESET_CALENDAR":
+        raise CalendarValidationError(
+            "reset requires --confirm RESET_CALENDAR"
+        )
+
+    result = reset_calendar_store(safeplane_home())
+
+    if args.json:
+        print_json(result)
+    else:
+        print(f"reset: {result['status']}")
+        print(f"events: {result['event_count']}")
+        print(f"backup: {result['backup_path']}")
+
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="safeplane calendar")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    create = subcommands.add_parser("create")
+    create.add_argument("--title", required=True)
+    create.add_argument("--start", required=True)
+    create.add_argument("--end", required=True)
+    create.add_argument("--timezone", default="Europe/Berlin")
+    create.add_argument("--description", default="")
+    create.add_argument("--json", action="store_true")
+    create.set_defaults(func=cmd_create)
+
+    list_parser = subcommands.add_parser("list")
+    date_group = list_parser.add_mutually_exclusive_group(required=True)
+    date_group.add_argument("--day")
+    date_group.add_argument("--week")
+    list_parser.add_argument("--timezone", default="Europe/Berlin")
+    list_parser.add_argument("--include-cancelled", action="store_true")
+    list_parser.add_argument("--json", action="store_true")
+    list_parser.set_defaults(func=cmd_list)
+
+    show = subcommands.add_parser("show")
+    show.add_argument("event_id")
+    show.add_argument("--json", action="store_true")
+    show.set_defaults(func=cmd_show)
+
+    cancel = subcommands.add_parser("cancel")
+    cancel.add_argument("event_id")
+    cancel.add_argument("--json", action="store_true")
+    cancel.set_defaults(func=cmd_cancel)
+
+    rebuild = subcommands.add_parser("rebuild-index")
+    rebuild.add_argument("--json", action="store_true")
+    rebuild.set_defaults(func=cmd_rebuild_index)
+
+    snapshot = subcommands.add_parser("snapshot")
+    snapshot.add_argument("--json", action="store_true")
+    snapshot.set_defaults(func=cmd_snapshot)
+
+
+    cleanup = subcommands.add_parser("cleanup")
+    cleanup.add_argument("--dry-run", action="store_true")
+    cleanup.add_argument("--json", action="store_true")
+    cleanup.set_defaults(func=cmd_cleanup)
+
+    reset = subcommands.add_parser("reset")
+    reset.add_argument("--dry-run", action="store_true")
+    reset.add_argument("--confirm", default="")
+    reset.add_argument("--json", action="store_true")
+    reset.set_defaults(func=cmd_reset)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        return args.func(args)
+    except CalendarNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except CalendarValidationError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+
+DISPOSABLE_TRACE_DIRS = ["traces"]
+FUTURE_DISPOSABLE_DIRS = ["artifacts", "workspaces", "checkouts"]
+RUNTIME_STATE_DIRS = ["sessions", "runs"]
+PROTECTED_DIRS = ["data", "backups", "config"]
+LEGACY_PROTECTED_DIRS = ["secrets"]
+MAINTENANCE_DIR = "maintenance"
+
+ACTIVE_STATUSES = {
+    "active",
+    "queued",
+    "running",
+    "waiting_for_approval",
+    "waiting_for_tool",
+    "cancelling",
+}
+
+
+@dataclass(frozen=True)
+class FileStats:
+    files: int
+    bytes: int
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safeplane_home() -> Path:
+    return Path(os.environ.get("SAFEPLANE_HOME", str(Path.home() / ".safeplane"))).expanduser()
+
+
+def ensure_runtime_dirs(home: Path) -> None:
+    for name in [
+        "sessions",
+        "runs",
+        "traces",
+        "artifacts",
+        "workspaces",
+        "checkouts",
+        "data",
+        "backups",
+        "config",
+        "maintenance",
+    ]:
+        path = home / name
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def parse_duration(value: str) -> timedelta:
+    value = value.strip().lower()
+
+    if len(value) < 2:
+        raise argparse.ArgumentTypeError("Duration must look like 30d, 12h, or 60m.")
+
+    amount_text = value[:-1]
+    unit = value[-1]
+
+    try:
+        amount = int(amount_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Duration amount must be an integer.") from exc
+
+    if amount < 0:
+        raise argparse.ArgumentTypeError("Duration must not be negative.")
+
+    if unit == "d":
+        return timedelta(days=amount)
+    if unit == "h":
+        return timedelta(hours=amount)
+    if unit == "m":
+        return timedelta(minutes=amount)
+
+    raise argparse.ArgumentTypeError("Duration unit must be d, h, or m.")
+
+
+def format_bytes(size: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+    return f"{size} B"
+
+
+def collect_stats(path: Path) -> FileStats:
+    if not path.exists():
+        return FileStats(files=0, bytes=0)
+
+    files = 0
+    total = 0
+
+    for item in path.rglob("*"):
+        if item.is_file():
+            files += 1
+            try:
+                total += item.stat().st_size
+            except FileNotFoundError:
+                pass
+
+    return FileStats(files=files, bytes=total)
+
+
+def storage(args: argparse.Namespace) -> int:
+    home = safeplane_home()
+    ensure_runtime_dirs(home)
+
+    rows: list[dict[str, Any]] = []
+
+    for name in [
+        "sessions",
+        "runs",
+        "traces",
+        "artifacts",
+        "workspaces",
+        "checkouts",
+        "data",
+        "backups",
+        "config",
+        "maintenance",
+    ] + [
+        name for name in LEGACY_PROTECTED_DIRS if (home / name).exists()
+    ]:
+        path = home / name
+        stats = collect_stats(path)
+        rows.append(
+            {
+                "name": name,
+                "path": str(path),
+                "files": stats.files,
+                "bytes": stats.bytes,
+                "protected": name in PROTECTED_DIRS or name in LEGACY_PROTECTED_DIRS,
+            }
+        )
+
+    result = {
+        "safeplane_home": str(home),
+        "directories": rows,
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+
+    print(f"SAFEPLANE_HOME: {home}")
+    print()
+
+    for row in rows:
+        protected = " protected" if row["protected"] else ""
+        print(
+            f"{row['name']:<12} "
+            f"{row['files']:>6} files "
+            f"{format_bytes(row['bytes']):>10}"
+            f"{protected}"
+        )
+
+    return 0
+
+
+def read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def session_status(home: Path, session_id: str) -> str | None:
+    sessions = home / "sessions"
+    candidates = [
+        sessions / f"{session_id}.json",
+        sessions / session_id / "session.json",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            data = read_json_file(path)
+            status = data.get("status")
+            return str(status) if status is not None else None
+
+    return None
+
+
+def active_session_ids(home: Path) -> set[str]:
+    active: set[str] = set()
+    sessions = home / "sessions"
+
+    if sessions.exists():
+        for item in sessions.rglob("*.json"):
+            data = read_json_file(item)
+            status = str(data.get("status", "")).lower()
+            session_id = data.get("session_id") or data.get("id") or item.stem
+
+            if status in ACTIVE_STATUSES:
+                active.add(str(session_id))
+
+    runs = home / "runs"
+    if runs.exists():
+        for item in runs.rglob("*.json"):
+            data = read_json_file(item)
+            status = str(data.get("status", "")).lower()
+            session_id = data.get("session_id")
+
+            if status in ACTIVE_STATUSES and session_id:
+                active.add(str(session_id))
+
+    return active
+
+
+def protected_run_ids(home: Path) -> set[str]:
+    protected: set[str] = set()
+    runs = home / "runs"
+    if not runs.exists():
+        return protected
+
+    for item in runs.glob("*.json"):
+        data = read_json_file(item)
+        run_id = str(data.get("run_id") or item.stem)
+        status = str(data.get("status") or "").lower()
+        pipeline = data.get("developer_pipeline") or {}
+        pipeline_state = str(pipeline.get("current_state") or "")
+        if (
+            status in ACTIVE_STATUSES
+            or pipeline_state == "waiting_for_remote_approval"
+            or pipeline.get("remote_approval_possible") is True
+        ):
+            protected.add(run_id)
+    return protected
+
+
+def directory_mtime(path: Path) -> datetime:
+    newest = path.stat().st_mtime
+
+    for item in path.rglob("*"):
+        try:
+            newest = max(newest, item.stat().st_mtime)
+        except FileNotFoundError:
+            pass
+
+    return datetime.fromtimestamp(newest, tz=timezone.utc)
+
+
+def trace_session_id(path: Path) -> str:
+    return path.name
+
+
+def cleanup_audit_path(home: Path) -> Path:
+    path = home / MAINTENANCE_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "cleanup.audit.jsonl"
+
+
+def write_audit(home: Path, record: dict[str, Any]) -> None:
+    path = cleanup_audit_path(home)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def clean(args: argparse.Namespace) -> int:
+    home = safeplane_home()
+    ensure_runtime_dirs(home)
+
+    threshold = datetime.now(timezone.utc) - args.older_than
+    active_sessions = active_session_ids(home)
+    protected_runs = protected_run_ids(home)
+
+    candidates: list[str] = []
+    deleted: list[str] = []
+    skipped: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
+
+    traces = home / "traces"
+
+    if traces.exists():
+        for trace_session_dir in sorted(path for path in traces.iterdir() if path.is_dir()):
+            session_id = trace_session_id(trace_session_dir)
+            mtime = directory_mtime(trace_session_dir)
+
+            if mtime >= threshold:
+                skipped.append(
+                    {
+                        "path": str(trace_session_dir),
+                        "reason": "not older than threshold",
+                    }
+                )
+                continue
+
+            if session_id in active_sessions:
+                skipped.append(
+                    {
+                        "path": str(trace_session_dir),
+                        "reason": "active session",
+                    }
+                )
+                continue
+
+            candidates.append(str(trace_session_dir))
+
+            if not args.dry_run:
+                try:
+                    shutil.rmtree(trace_session_dir)
+                    deleted.append(str(trace_session_dir))
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "path": str(trace_session_dir),
+                            "error": str(exc),
+                        }
+                    )
+
+    workspaces = home / "workspaces"
+    if workspaces.exists():
+        for workspace_dir in sorted(path for path in workspaces.iterdir() if path.is_dir()):
+            run_id = workspace_dir.name
+            mtime = directory_mtime(workspace_dir)
+
+            if mtime >= threshold:
+                skipped.append(
+                    {
+                        "path": str(workspace_dir),
+                        "reason": "not older than threshold",
+                    }
+                )
+                continue
+
+            if run_id in protected_runs:
+                skipped.append(
+                    {
+                        "path": str(workspace_dir),
+                        "reason": "active or awaiting remote write",
+                    }
+                )
+                continue
+
+            candidates.append(str(workspace_dir))
+
+            if not args.dry_run:
+                try:
+                    shutil.rmtree(workspace_dir)
+                    deleted.append(str(workspace_dir))
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "path": str(workspace_dir),
+                            "error": str(exc),
+                        }
+                    )
+
+    record = {
+        "ts": utc_now(),
+        "command": "clean",
+        "dry_run": args.dry_run,
+        "older_than": args.older_than_text,
+        "candidates": candidates,
+        "deleted": deleted,
+        "skipped": skipped,
+        "errors": errors,
+    }
+    write_audit(home, record)
+
+    if args.dry_run:
+        print("Dry run. No files deleted.")
+    else:
+        print("Cleanup completed.")
+
+    print(f"Candidates: {len(candidates)}")
+    print(f"Deleted: {len(deleted)}")
+    print(f"Skipped: {len(skipped)}")
+    print(f"Errors: {len(errors)}")
+    print(f"Audit: {cleanup_audit_path(home)}")
+
+    if candidates:
+        print()
+        print("Candidate trace/workspace directories:")
+        for path in candidates:
+            print(f"- {path}")
+
+    return 1 if errors else 0
+
+
+def clean_all(args: argparse.Namespace) -> int:
+    home = safeplane_home()
+    ensure_runtime_dirs(home)
+
+    delete_dirs = [
+        "sessions",
+        "runs",
+        "traces",
+        "artifacts",
+        "workspaces",
+        "checkouts",
+        "maintenance",
+    ]
+
+    print("WARNING: clean-all deletes Safeplane runtime state.")
+    print()
+    print("It will delete:")
+    for name in delete_dirs:
+        print(f"- {home / name}")
+    print()
+    print("It will NOT delete protected durable directories:")
+    for name in PROTECTED_DIRS:
+        print(f"- {home / name}")
+    for name in LEGACY_PROTECTED_DIRS:
+        legacy_path = home / name
+        if legacy_path.exists():
+            print(f"- {legacy_path} (legacy, preserved but not created)")
+    print()
+
+    if args.confirm != "DELETE":
+        if not sys.stdin.isatty():
+            print("Refusing clean-all without --confirm DELETE in non-interactive mode.")
+            return 2
+
+        typed = input("Type DELETE to continue: ").strip()
+        if typed != "DELETE":
+            print("Aborted.")
+            return 2
+
+    deleted: list[str] = []
+    errors: list[dict[str, str]] = []
+
+    for name in delete_dirs:
+        path = home / name
+
+        if not path.exists():
+            continue
+
+        try:
+            shutil.rmtree(path)
+            deleted.append(str(path))
+        except Exception as exc:
+            errors.append({"path": str(path), "error": str(exc)})
+
+    ensure_runtime_dirs(home)
+
+    record = {
+        "ts": utc_now(),
+        "command": "clean-all",
+        "dry_run": False,
+        "deleted": deleted,
+        "protected": [str(home / name) for name in PROTECTED_DIRS]
+        + [
+            str(home / name)
+            for name in LEGACY_PROTECTED_DIRS
+            if (home / name).exists()
+        ],
+        "errors": errors,
+    }
+    write_audit(home, record)
+
+    print("clean-all completed.")
+    print(f"Deleted: {len(deleted)}")
+    print(f"Errors: {len(errors)}")
+    print(f"Audit: {cleanup_audit_path(home)}")
+
+    return 1 if errors else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Safeplane runtime maintenance.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    storage_parser = subparsers.add_parser("storage")
+    storage_parser.add_argument("--json", action="store_true")
+    storage_parser.set_defaults(func=storage)
+
+    clean_parser = subparsers.add_parser("clean")
+    clean_parser.add_argument("--dry-run", action="store_true")
+    clean_parser.add_argument("--older-than", default="30d")
+    clean_parser.set_defaults(func=clean)
+
+    clean_all_parser = subparsers.add_parser("clean-all")
+    clean_all_parser.add_argument("--confirm", default="")
+    clean_all_parser.set_defaults(func=clean_all)
+
+    args = parser.parse_args()
+
+    if args.command == "clean":
+        args.older_than_text = args.older_than
+        args.older_than = parse_duration(args.older_than)
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

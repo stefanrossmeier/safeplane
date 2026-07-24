@@ -1,0 +1,14 @@
+{
+  "type": "final",
+  "implementation_summary_markdown": "# Implementation Summary\n\nThis first final response intentionally exceeds the approved changed-line budget.",
+  "replacements": [
+    {
+      "path": "src/greeter.py",
+      "old_text": "    return f\"Hello, {name}!\"",
+      "new_text": "    prefix = \"Hello from\"\n    source = \"the developer pipeline\"\n    punctuation = \"!\"\n    return f\"{prefix} {source}, {name}{punctuation}\""
+    }
+  ],
+  "changed_files": [
+    "src/greeter.py"
+  ]
+}

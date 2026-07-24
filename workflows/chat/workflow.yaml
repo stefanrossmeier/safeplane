@@ -1,0 +1,39 @@
+workflow_id: chat
+version: 0.1.0
+description: Simple general-purpose chat workflow for basic conversation.
+supported_entrypoints:
+- chat
+examples:
+- Say hello
+- Explain this concept briefly
+prompt:
+  id: chat.system
+  version: v1
+  path: /app/prompts/chat/system.v1.md
+model_profiles:
+  default:
+    litellm_model: openrouter/openrouter/free
+    temperature: 0.3
+    max_tokens: 1000
+session:
+  receives_history: true
+concurrency:
+  same_session: serial
+  different_sessions: parallel_allowed_later
+mcp:
+  servers: []
+  max_tool_call_retries: 5
+  allowed_servers: {}
+tools:
+  enabled: false
+  allowed: []
+functions:
+  enabled: false
+  allowed: []
+io:
+  input:
+    messages: list
+  output:
+    final_message: string
+deterministic_tools:
+  enabled: []

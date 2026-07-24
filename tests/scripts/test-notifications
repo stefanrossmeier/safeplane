@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+export PYTHONPATH="services/harness/src:mcp-servers/notification-task/src:services/scheduler/src:${PYTHONPATH:-}"
+
+pytest \
+  tests/unit/test_notification_store.py \
+  tests/unit/test_notification_task_mcp.py \
+  tests/unit/test_notification_mcp_schema_registry.py \
+  tests/unit/test_scheduler_service.py \
+  "$@"

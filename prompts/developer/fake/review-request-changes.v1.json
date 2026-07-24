@@ -1,0 +1,12 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "summary": "The fake review scenario intentionally stops the run before PR preparation.",
+  "requested_changes": [
+    "Add focused evidence for the changed behavior before preparing a pull request."
+  ],
+  "docs_update_needed": false,
+  "risk_notes": [
+    "The run must not continue automatically after this verdict."
+  ],
+  "plan_alignment": "DEVIATION"
+}

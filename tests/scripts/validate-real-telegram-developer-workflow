@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+: "${SAFEPLANE_REAL_TELEGRAM_PROFILE:?Set SAFEPLANE_REAL_TELEGRAM_PROFILE to an enabled repository profile}"
+: "${SAFEPLANE_REAL_TELEGRAM_TASK:?Set SAFEPLANE_REAL_TELEGRAM_TASK to one bounded reviewable task}"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-telegram-real"
+HOME_DIR="${SAFEPLANE_HOME:-$HOME/.safeplane}"
+EVENTS="$HOME_DIR/connectors/telegram/events.jsonl"
+PORT="${SAFEPLANE_HARNESS_PORT:-8787}"
+
+for secret in telegram_bot_token telegram_allowed_user_ids openrouter_api_key; do
+  test -s "$HOME_DIR/secrets/$secret" || {
+    echo "Missing required secret file: $HOME_DIR/secrets/$secret" >&2
+    exit 1
+  }
+done
+
+mkdir -p "$(dirname "$EVENTS")"
+touch "$EVENTS"
+
+dump_diagnostics() {
+  echo >&2
+  echo "=== Telegram and harness container status ===" >&2
+  "$COMPOSE" ps telegram-connector harness dev-workspace-mcp dev-check-mcp >&2 || true
+  echo >&2
+  echo "=== Recent Telegram connector events ===" >&2
+  tail -n 80 "$EVENTS" >&2 || true
+  echo >&2
+  echo "=== Recent Telegram connector logs ===" >&2
+  "$COMPOSE" logs --tail=160 telegram-connector >&2 || true
+  echo >&2
+  echo "=== Recent harness logs ===" >&2
+  "$COMPOSE" logs --tail=120 harness >&2 || true
+}
+
+echo "Starting the secondary real Telegram developer-workflow acceptance..."
+"$COMPOSE" up -d --build \
+  model-gateway \
+  calendar-task-mcp \
+  notification-task-mcp \
+  dev-workspace-mcp \
+  dev-workspace-apply-mcp \
+  dev-check-mcp \
+  harness
+
+startup_baseline="$(wc -l < "$EVENTS" | tr -d ' ')"
+"$COMPOSE" up -d --build --force-recreate telegram-connector scheduler
+
+if ! ready_result="$({ python3 - "$EVENTS" "$startup_baseline" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+path = pathlib.Path(sys.argv[1])
+baseline = int(sys.argv[2])
+deadline = time.monotonic() + 90
+connector = None
+last_polling_error = None
+while time.monotonic() < deadline:
+    for line in path.read_text(encoding="utf-8").splitlines()[baseline:]:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event = row.get("event")
+        if event == "connector_started":
+            connector = row.get("payload") or {}
+        elif event == "polling_failed":
+            last_polling_error = row.get("error") or {}
+        elif event == "polling_ready":
+            allowed_count = int((connector or {}).get("allowed_user_count") or 0)
+            if allowed_count < 1:
+                raise SystemExit("No allowed Telegram user ids are configured")
+            payload = row.get("payload") or {}
+            print(
+                f"Telegram polling is ready: @{payload.get('bot_username') or 'unknown'}; "
+                f"configured allowed users: {allowed_count}"
+            )
+            raise SystemExit(0)
+    time.sleep(1)
+message = "Telegram connector never reached polling_ready."
+if last_polling_error:
+    message += (
+        f" Last polling error: {last_polling_error.get('type')}: "
+        f"{last_polling_error.get('message')}"
+    )
+raise SystemExit(message)
+PY
+} 2>&1)"; then
+  echo "$ready_result" >&2
+  dump_diagnostics
+  exit 1
+fi
+echo "$ready_result"
+
+develop_baseline="$(wc -l < "$EVENTS" | tr -d ' ')"
+cat <<TEXT
+
+Send this direct developer command to the configured Telegram bot:
+
+/develop ${SAFEPLANE_REAL_TELEGRAM_PROFILE} ${SAFEPLANE_REAL_TELEGRAM_TASK}
+
+The bot should acknowledge the run and report stage progress.
+TEXT
+read -r -p "Press Enter after the developer-run acknowledgement is visible in Telegram... "
+
+if ! run_id="$({ python3 - "$EVENTS" "$develop_baseline" "$SAFEPLANE_REAL_TELEGRAM_PROFILE" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+path = pathlib.Path(sys.argv[1])
+baseline = int(sys.argv[2])
+profile = sys.argv[3]
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline:
+    for line in path.read_text(encoding="utf-8").splitlines()[baseline:]:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event = row.get("event")
+        payload = row.get("payload") or {}
+        error = row.get("error") or {}
+        if (
+            event == "workflow_started"
+            and payload.get("entrypoint") == "develop"
+            and payload.get("repository_profile") == profile
+        ):
+            print(payload["run_id"])
+            raise SystemExit(0)
+        if event == "message_rejected":
+            raise SystemExit(
+                "Telegram received the command but rejected the user: "
+                + str(payload.get("reason"))
+            )
+        if event == "update_handling_failed" and payload.get("command") == "/develop":
+            raise SystemExit(
+                f"Telegram received /develop but processing failed: "
+                f"{error.get('type')}: {error.get('message')}"
+            )
+    time.sleep(1)
+raise SystemExit("No matching Telegram developer workflow start was observed")
+PY
+} 2>&1)"; then
+  echo "$run_id" >&2
+  dump_diagnostics
+  exit 1
+fi
+
+echo "Observed Telegram developer run: $run_id"
+
+python3 - "$PORT" "$run_id" <<'PY'
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+port, run_id = sys.argv[1:]
+url = f"http://127.0.0.1:{port}/runs/{run_id}"
+for _ in range(14400):
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            run = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, json.JSONDecodeError):
+        time.sleep(1)
+        continue
+    if run.get("status") in {"completed", "failed", "cancelled"}:
+        break
+    time.sleep(1)
+else:
+    raise SystemExit(f"Timed out waiting for run {run_id}")
+
+if run.get("status") != "completed":
+    raise SystemExit(json.dumps(run, indent=2))
+pipeline = run.get("developer_pipeline") or {}
+assert pipeline.get("current_state") in {
+    "waiting_for_remote_approval",
+    "completed",
+}, pipeline
+assert (pipeline.get("check_summary") or {}).get("status") == "passed", pipeline
+assert pipeline.get("review_verdict") == "LGTM", pipeline
+print(json.dumps({
+    "run_id": run_id,
+    "status": run["status"],
+    "pipeline_state": pipeline.get("current_state"),
+    "review": pipeline.get("review_verdict"),
+    "draft_pr": (pipeline.get("remote_write") or {}).get("pull_request_url"),
+}, indent=2))
+PY
+
+echo "OK: secondary real Telegram developer command reached an accepted terminal state"

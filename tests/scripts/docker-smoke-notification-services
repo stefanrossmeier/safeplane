@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "Checking scheduler health/status..."
+tests/scripts/compose-safeplane-notifications exec -T scheduler python - <<'PY'
+import urllib.request
+
+for url in [
+    "http://127.0.0.1:8080/health",
+    "http://127.0.0.1:8080/status",
+]:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        print(url, response.status, response.read().decode())
+PY
+
+echo
+echo "Calling notification-task MCP direct smoke..."
+tests/scripts/compose-safeplane-notifications exec -T notification-task-mcp python - <<'PY'
+import json
+import urllib.request
+from datetime import UTC, datetime
+
+
+def call_mcp(tool_name: str, arguments: dict) -> dict:
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "notification-direct-smoke",
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+        },
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "http://127.0.0.1:8080/mcp",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=10) as response:
+        raw = response.read().decode()
+        print(tool_name, response.status)
+        print(raw)
+        print()
+        payload = json.loads(raw)
+
+    if payload.get("error"):
+        raise RuntimeError(payload["error"])
+
+    result = payload["result"]
+    return result["structuredContent"]
+
+
+message = "notification storage direct MCP smoke " + datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+scheduled = call_mcp(
+    "notification_schedule",
+    {
+        "message": message,
+        "schedule": {
+            "schedule_type": "once",
+            "run_at_local": "2099-01-01T09:00:00",
+            "timezone": "Europe/Berlin",
+        },
+        "targets": ["all"],
+    },
+)
+
+notification_id = scheduled["notification_id"]
+assert scheduled["status"] == "active"
+assert scheduled["reload"]["status"] in {"ok", "failed"}
+
+listed = call_mcp(
+    "notification_list",
+    {
+        "include_cancelled": False,
+    },
+)
+
+assert any(item["id"] == notification_id for item in listed["notifications"])
+
+cancelled = call_mcp(
+    "notification_cancel",
+    {
+        "notification_id": notification_id,
+    },
+)
+
+assert cancelled["notification_id"] == notification_id
+assert cancelled["status"] == "cancelled"
+assert cancelled["reload"]["status"] in {"ok", "failed"}
+
+print("scheduled:", notification_id)
+print("listed:", notification_id)
+print("cancelled:", notification_id)
+print("OK")
+PY
+
+echo
+echo "Recent notification schedules:"
+tail -5 "$HOME/.safeplane/data/notifications/schedules.jsonl" 2>/dev/null || true
+
+echo
+echo "Recent notification MCP logs:"
+tail -20 "$HOME/.safeplane/logs/mcp/notification-task-mcp.jsonl" 2>/dev/null || true
+
+echo
+echo "Recent scheduler logs:"
+tail -20 "$HOME/.safeplane/logs/scheduler/scheduler.jsonl" 2>/dev/null || true

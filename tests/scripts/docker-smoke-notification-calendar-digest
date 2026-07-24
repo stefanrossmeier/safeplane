@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+export SAFEPLANE_HARNESS_URL="${SAFEPLANE_HARNESS_URL:-http://127.0.0.1:8787}"
+export SAFEPLANE_TEST_HOME="${SAFEPLANE_HOME:-$HOME/.safeplane}"
+
+python3 - <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.request
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+harness_url = os.environ["SAFEPLANE_HARNESS_URL"].rstrip("/")
+safeplane_home = Path(os.environ["SAFEPLANE_TEST_HOME"]).expanduser()
+
+calendar_path = safeplane_home / "data" / "calendar" / "notificationc-smoke.jsonl"
+outbox_path = safeplane_home / "data" / "notifications" / "outbox.jsonl"
+deliveries_path = safeplane_home / "data" / "notifications" / "deliveries.jsonl"
+
+
+def wait_for_harness() -> None:
+    deadline = time.time() + 60
+    last_error = None
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(harness_url + "/health", timeout=3) as response:
+                print("harness health:", response.status, response.read().decode())
+                return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2)
+
+    raise RuntimeError(f"Harness did not become ready: {last_error}")
+
+
+def post_json(url: str, payload: dict) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=20) as response:
+        raw = response.read().decode("utf-8")
+        print(f"POST {url} -> {response.status}")
+        print(raw)
+        print()
+        return json.loads(raw)
+
+
+def broker_call(tool_name: str, arguments: dict) -> dict:
+    response = post_json(
+        harness_url + "/mcp/tools/call",
+        {
+            "workflow_id": "assistant",
+            "server_id": "notification",
+            "tool_name": tool_name,
+            "arguments": arguments,
+        },
+    )
+
+    if response.get("is_error"):
+        raise RuntimeError(response)
+
+    return response["structured_content"]
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return records
+
+
+wait_for_harness()
+
+now_utc = datetime.now(UTC)
+now_berlin = now_utc.astimezone(ZoneInfo("Europe/Berlin"))
+
+event_start = now_berlin + timedelta(minutes=2)
+event_end = event_start + timedelta(minutes=30)
+run_at_local = now_berlin + timedelta(seconds=20)
+
+marker = "notification delivery integration calendar digest smoke " + now_utc.isoformat(timespec="seconds").replace("+00:00", "Z")
+event_title = marker + " event"
+digest_title = marker + " digest"
+
+calendar_path.parent.mkdir(parents=True, exist_ok=True)
+with calendar_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "id": "cal_notificationc_" + str(int(time.time())),
+        "title": event_title,
+        "start_at": event_start.replace(microsecond=0).isoformat(),
+        "end_at": event_end.replace(microsecond=0).isoformat(),
+        "status": "active",
+    }, sort_keys=True) + "\n")
+
+print("calendar event:", event_title)
+print("calendar path:", calendar_path)
+print("run_at_local:", run_at_local.replace(microsecond=0).isoformat())
+print()
+
+scheduled = broker_call(
+    "notification_schedule",
+    {
+        "payload": {
+            "payload_type": "calendar_digest",
+            "range": "today",
+            "timezone": "Europe/Berlin",
+            "title": digest_title,
+        },
+        "schedule": {
+            "schedule_type": "once",
+            "run_at_local": run_at_local.replace(microsecond=0).isoformat(),
+            "timezone": "Europe/Berlin",
+        },
+        "targets": ["all"],
+        "grace_seconds": 120,
+    },
+)
+
+notification_id = scheduled["notification_id"]
+print("scheduled:", notification_id)
+print("next_run_at_utc:", scheduled["next_run_at_utc"])
+print()
+
+deadline = time.time() + 90
+found_outbox = None
+found_delivery = None
+
+while time.time() < deadline:
+    outbox_records = read_jsonl(outbox_path)
+    delivery_records = read_jsonl(deliveries_path)
+
+    for record in reversed(outbox_records):
+        if record.get("schedule_id") == notification_id and record.get("status") == "sent":
+            if digest_title in record.get("message", "") and event_title in record.get("message", ""):
+                found_outbox = record
+                break
+
+    for record in reversed(delivery_records):
+        if record.get("schedule_id") == notification_id and record.get("status") == "sent":
+            found_delivery = record
+            break
+
+    if found_outbox and found_delivery:
+        break
+
+    time.sleep(2)
+
+if not found_outbox or not found_delivery:
+    print("Did not observe rendered calendar digest delivery.", file=sys.stderr)
+    print("notification_id:", notification_id, file=sys.stderr)
+    print("digest_title:", digest_title, file=sys.stderr)
+    print("event_title:", event_title, file=sys.stderr)
+
+    print("\nRecent outbox:", file=sys.stderr)
+    for record in read_jsonl(outbox_path)[-20:]:
+        print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+    print("\nRecent deliveries:", file=sys.stderr)
+    for record in read_jsonl(deliveries_path)[-20:]:
+        print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+    raise SystemExit(1)
+
+print("outbox sent:", found_outbox["id"])
+print("delivery sent:", found_delivery["id"])
+print("rendered message:")
+print(found_outbox["message"])
+print()
+print("OK")
+PY

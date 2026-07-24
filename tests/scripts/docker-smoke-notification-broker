@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+export SAFEPLANE_HARNESS_URL="${SAFEPLANE_HARNESS_URL:-http://127.0.0.1:8787}"
+
+echo "Waiting for harness at ${SAFEPLANE_HARNESS_URL}..."
+python3 - <<'PY'
+import os
+import sys
+import time
+import urllib.request
+
+harness_url = os.environ["SAFEPLANE_HARNESS_URL"].rstrip("/")
+deadline = time.time() + 60
+last_error = None
+
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(harness_url + "/health", timeout=3) as response:
+            print("harness health:", response.status, response.read().decode())
+            raise SystemExit(0)
+    except Exception as exc:
+        last_error = exc
+        time.sleep(2)
+
+print(f"Harness did not become ready at {harness_url}: {last_error}", file=sys.stderr)
+raise SystemExit(1)
+PY
+
+python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from datetime import UTC, datetime
+
+harness_url = os.environ.get("SAFEPLANE_HARNESS_URL", "http://127.0.0.1:8787").rstrip("/")
+
+
+def post_json(url: str, payload: dict) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            raw = response.read().decode("utf-8")
+            print(f"POST {url} -> {response.status}")
+            print(raw)
+            print()
+            return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8")
+        print(f"POST {url} -> {exc.code}", file=sys.stderr)
+        print(raw, file=sys.stderr)
+        raise
+
+
+def structured_content(response: dict) -> dict:
+    candidates = [
+        response.get("structured_content"),
+        response.get("structuredContent"),
+    ]
+
+    result = response.get("result")
+    if isinstance(result, dict):
+        candidates.extend(
+            [
+                result.get("structured_content"),
+                result.get("structuredContent"),
+            ]
+        )
+
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return candidate
+
+    raise RuntimeError(f"Could not find structured content in response: {response}")
+
+
+def broker_call(tool_name: str, arguments: dict) -> dict:
+    payload = {
+        "workflow_id": "assistant",
+        "server_id": "notification",
+        "tool_name": tool_name,
+        "arguments": arguments,
+    }
+
+    response = post_json(
+        harness_url + "/mcp/tools/call",
+        payload,
+    )
+    return structured_content(response)
+
+
+print("Safeplane notification broker smoke")
+print("harness_url:", harness_url)
+print()
+
+message = "notification storage harness broker smoke " + datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+schedule_result = broker_call(
+    "notification_schedule",
+    {
+        "message": message,
+        "schedule": {
+            "schedule_type": "once",
+            "run_at_local": "2099-01-01T09:00:00",
+            "timezone": "Europe/Berlin",
+        },
+        "targets": ["all"],
+    },
+)
+
+notification_id = schedule_result["notification_id"]
+
+assert notification_id.startswith("notif_sched_")
+assert schedule_result["status"] == "active"
+assert schedule_result["next_run_at_utc"] == "2099-01-01T08:00:00Z"
+assert schedule_result["reload"]["status"] in {"ok", "failed"}
+
+print("scheduled:", notification_id)
+print("reload:", schedule_result["reload"])
+print()
+
+list_result = broker_call(
+    "notification_list",
+    {
+        "include_cancelled": False,
+    },
+)
+
+notifications = list_result["notifications"]
+assert any(item["id"] == notification_id for item in notifications)
+
+print("listed notification:", notification_id)
+print()
+
+cancel_result = broker_call(
+    "notification_cancel",
+    {
+        "notification_id": notification_id,
+    },
+)
+
+assert cancel_result["notification_id"] == notification_id
+assert cancel_result["status"] == "cancelled"
+assert cancel_result["reload"]["status"] in {"ok", "failed"}
+
+print("cancelled:", notification_id)
+print("reload:", cancel_result["reload"])
+print()
+print("OK")
+PY
+
+echo
+echo "Recent notification schedules:"
+tail -5 "$HOME/.safeplane/data/notifications/schedules.jsonl" 2>/dev/null || true
+
+echo
+echo "Recent notification MCP logs:"
+tail -20 "$HOME/.safeplane/logs/mcp/notification-task-mcp.jsonl" 2>/dev/null || true
+
+echo
+echo "Recent scheduler logs:"
+tail -20 "$HOME/.safeplane/logs/scheduler/scheduler.jsonl" 2>/dev/null || true

@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-github-mock"
+PROJECT="${SAFEPLANE_DRAFT_PR_PROJECT:-safeplane-draft-pr-smoke}"
+PORT="${SAFEPLANE_DRAFT_PR_PORT:-8810}"
+if [[ -n "${SAFEPLANE_DRAFT_PR_HOME:-}" ]]; then
+  HOME_DIR="$SAFEPLANE_DRAFT_PR_HOME"
+  HOME_CREATED=no
+else
+  HOME_DIR="$(mktemp -d)"
+  HOME_CREATED=yes
+fi
+if [[ -n "${SAFEPLANE_DRAFT_PR_SECRET_ROOT:-}" ]]; then
+  SECRET_DIR="$SAFEPLANE_DRAFT_PR_SECRET_ROOT"
+  SECRET_CREATED=no
+else
+  SECRET_DIR="$(mktemp -d)"
+  SECRET_CREATED=yes
+fi
+KEEP="${SAFEPLANE_DRAFT_PR_KEEP:-no}"
+
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export SAFEPLANE_HOME="$HOME_DIR"
+export SAFEPLANE_HARNESS_PORT="$PORT"
+export SAFEPLANE_DEV_SOURCE="$ROOT/tests/fixtures/developer-repo"
+export SAFEPLANE_REPOSITORY_CONFIG="/data/safeplane/config/repositories.yaml"
+export SAFEPLANE_ALLOW_LOCAL_GIT_FIXTURES=yes
+export SAFEPLANE_GITHUB_TOKEN_FILE="$SECRET_DIR/github_token"
+
+mkdir -p \
+  "$SAFEPLANE_HOME/workspaces" \
+  "$SAFEPLANE_HOME/config" \
+  "$SAFEPLANE_HOME/git-fixtures" \
+  "$SAFEPLANE_HOME/mock-github" \
+  "$SECRET_DIR"
+chmod 0755 "$SAFEPLANE_HOME/workspaces" "$SAFEPLANE_HOME/mock-github"
+printf '%s\n' 'github_pat_draft_pr_fixture_token_not_real' > "$SAFEPLANE_GITHUB_TOKEN_FILE"
+# The Compose file-secret source is a bind-mounted host file on native Linux.
+# Keep the private temporary directory owner-only while making the fake token
+# readable by the non-root harness UID inside the container.
+chmod 0644 "$SAFEPLANE_GITHUB_TOKEN_FILE"
+
+cleanup() {
+  if [[ "$KEEP" != "yes" ]]; then
+    cleanup_image="$("$COMPOSE" images -q harness 2>/dev/null | head -n 1 || true)"
+    "$COMPOSE" down --remove-orphans --volumes >/dev/null 2>&1 || true
+    if [[ "$HOME_CREATED" == "yes" ]]; then
+      "$ROOT/tests/scripts/remove-container-owned-tree" "$HOME_DIR" "$cleanup_image"
+    fi
+    if [[ "$SECRET_CREATED" == "yes" ]]; then rm -rf "$SECRET_DIR"; fi
+  else
+    echo "Keeping draft-PR publication smoke runtime: project=$PROJECT SAFEPLANE_HOME=$HOME_DIR SAFEPLANE_DRAFT_PR_SECRET_ROOT=$SECRET_DIR"
+  fi
+}
+trap cleanup EXIT
+
+create_target_repo() {
+  local name="$1"
+  local check_mode="$2"
+  "$COMPOSE" exec -T harness python3 - "$name" "$check_mode" <<'PY'
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+name, check_mode = sys.argv[1:]
+root = Path("/data/safeplane/publication-remotes")
+work = Path("/tmp") / f"{name}-work"
+bare = root / f"{name}.git"
+shutil.rmtree(work, ignore_errors=True)
+shutil.rmtree(bare, ignore_errors=True)
+(work / "src").mkdir(parents=True)
+(work / "checks").mkdir(parents=True)
+(work / "README.md").write_text(f"# draft-PR publication {name} fixture\n", encoding="utf-8")
+(work / "src" / "greeter.py").write_text(
+    'def greet(name: str) -> str:\n    return f"Hello, {name}!"\n',
+    encoding="utf-8",
+)
+if check_mode == "pass":
+    check = (
+        'from pathlib import Path\n'
+        'content = Path("src/greeter.py").read_text(encoding="utf-8")\n'
+        'assert "Hello from the developer pipeline" in content, content\n'
+        'print("controlled greeting check passed")\n'
+    )
+else:
+    check = (
+        'import sys\n'
+        'print("intentional controlled check failure", file=sys.stderr)\n'
+        'sys.exit(7)\n'
+    )
+(work / "checks" / "check_greeting.py").write_text(check, encoding="utf-8")
+
+def run(*args: str) -> None:
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
+
+run("git", "-C", str(work), "init", "-q", "-b", "main")
+run("git", "-C", str(work), "config", "user.name", "Safeplane fixture")
+run("git", "-C", str(work), "config", "user.email", "fixture@example.invalid")
+run("git", "-C", str(work), "add", ".")
+run("git", "-C", str(work), "commit", "-qm", "fixture")
+run("git", "clone", "-q", "--bare", str(work), str(bare))
+print(subprocess.check_output(["git", "-C", str(work), "rev-parse", "HEAD"], text=True).strip())
+PY
+}
+
+remote_git() {
+  local name="$1"
+  shift
+  "$COMPOSE" exec -T harness git --git-dir="/data/safeplane/publication-remotes/${name}.git" "$@"
+}
+
+create_skill_repo() {
+  local work="$SAFEPLANE_HOME/git-fixtures/skills-work"
+  local bare="$SAFEPLANE_HOME/git-fixtures/skills.git"
+  rm -rf "$work" "$bare"
+  mkdir -p "$work/skills/archdoc/templates"
+  git -C "$work" init -q -b main
+  git -C "$work" config user.name "Safeplane fixture"
+  git -C "$work" config user.email "fixture@example.invalid"
+  cat > "$work/skills/archdoc/SKILL.md" <<'EOF_SKILL'
+# External archdoc fixture
+
+Create evidence-based repository documentation and preserve exact source provenance.
+EOF_SKILL
+  printf '%s\n' '# Repository map template' > "$work/skills/archdoc/templates/REPO_MAP.template.md"
+  git -C "$work" add .
+  git -C "$work" commit -qm "archdoc fixture"
+  git clone -q --bare "$work" "$bare"
+  git -C "$work" rev-parse HEAD
+}
+
+skill_commit="$(create_skill_repo)"
+export SAFEPLANE_ARCHDOC_REPOSITORY_URL="file:///data/safeplane/git-fixtures/skills.git"
+
+cat > "$SAFEPLANE_HOME/config/repositories.yaml" <<'YAML'
+version: 1
+credential_profiles:
+  github:
+    type: github_token_file
+    secret_path: /run/secrets/github_token
+    username: x-access-token
+repository_profiles:
+  draft_pr-success:
+    enabled: true
+    repository_url: file:///data/safeplane/publication-remotes/target-success.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: github
+    allow_file_url: true
+    remote_write_allowed: true
+    branch_prefix: safeplane/
+    pull_request_repository: fixture/target
+    git_author_name: Safeplane fixture
+    git_author_email: safeplane-fixture@example.invalid
+  draft_pr-auto:
+    enabled: true
+    repository_url: file:///data/safeplane/publication-remotes/target-auto.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: github
+    allow_file_url: true
+    remote_write_allowed: true
+    draft_pr_creation: automatic
+    branch_prefix: safeplane/
+    pull_request_repository: fixture/auto
+    git_author_name: Safeplane fixture
+    git_author_email: safeplane-fixture@example.invalid
+  draft_pr-changed:
+    enabled: true
+    repository_url: file:///data/safeplane/publication-remotes/target-changed.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: github
+    allow_file_url: true
+    remote_write_allowed: true
+    branch_prefix: safeplane/
+    pull_request_repository: fixture/changed
+  draft_pr-moved:
+    enabled: true
+    repository_url: file:///data/safeplane/publication-remotes/target-moved.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: github
+    allow_file_url: true
+    remote_write_allowed: true
+    branch_prefix: safeplane/
+    pull_request_repository: fixture/moved
+  draft_pr-fail:
+    enabled: true
+    repository_url: file:///data/safeplane/publication-remotes/target-fail.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: github
+    allow_file_url: true
+    remote_write_allowed: true
+    branch_prefix: safeplane/
+    pull_request_repository: fixture/fail
+YAML
+
+wait_health() {
+  local deadline=$((SECONDS + 120))
+  until curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      "$COMPOSE" ps >&2 || true
+      "$COMPOSE" logs harness github-mock dev-workspace-mcp dev-workspace-apply-mcp dev-check-mcp >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+post_run() {
+  local profile="$1"
+  local message="$2"
+  local response_file status payload
+  response_file="$(mktemp)"
+  payload="$(python3 - "$profile" "$message" <<'PY'
+import json, sys
+print(json.dumps({"connector":"cli", "repository_profile":sys.argv[1], "message":sys.argv[2]}))
+PY
+)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:${PORT}/connector/develop" \
+    -H 'Content-Type: application/json' -d "$payload")"
+  printf '%s\n' "$status"
+  cat "$response_file"
+  rm -f "$response_file"
+}
+
+approve_run() {
+  local run_id="$1"
+  local connector="${2:-cli}"
+  local response_file status
+  response_file="$(mktemp)"
+  status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:${PORT}/runs/${run_id}/remote/approve" \
+    -H 'Content-Type: application/json' \
+    -d "{\"approved\":true,\"connector\":\"${connector}\"}")"
+  printf '%s\n' "$status"
+  cat "$response_file"
+  rm -f "$response_file"
+}
+
+run_id_from_success_response() {
+  python3 - "$1" <<'PY'
+import json, sys
+row=json.loads(sys.argv[1]); assert row["status"]=="completed", row; print(row["run_id"])
+PY
+}
+
+latest_run_for_profile() {
+  "$COMPOSE" exec -T harness python3 - "$1" <<'PY'
+import json, sys
+from pathlib import Path
+profile=sys.argv[1]
+runs=[json.loads(path.read_text()) for path in Path('/data/safeplane/runs').glob('run_*.json')]
+rows=[row for row in runs if row.get('repository_profile')==profile]
+print(max(rows, key=lambda row: row['created_at'])['run_id'])
+PY
+}
+
+assert_no_run_branch() {
+  local remote_name="$1"
+  local run_id="$2"
+  local branch="safeplane/${run_id#run_}"
+  local output status
+
+  if output="$(remote_git "$remote_name" show-ref --verify --quiet "refs/heads/$branch" 2>&1)"; then
+    echo "Unexpected remote branch exists: $branch" >&2
+    exit 1
+  else
+    status="$?"
+  fi
+
+  if [[ "$status" -ne 1 ]]; then
+    echo "Unable to verify remote branch absence: remote=$remote_name branch=$branch status=$status" >&2
+    if [[ -n "$output" ]]; then
+      printf '%s\n' "$output" >&2
+    fi
+    exit 1
+  fi
+}
+
+echo "Starting isolated draft-PR publication remote-write stack..."
+"$COMPOSE" up -d --build
+wait_health
+
+"$COMPOSE" exec -T harness test -s /run/secrets/github_token
+for service in model-gateway calendar-task-mcp notification-task-mcp scheduler dev-workspace-mcp dev-workspace-apply-mcp dev-check-mcp github-mock; do
+  "$COMPOSE" exec -T "$service" sh -lc 'test ! -e /run/secrets/github_token && test ! -e /data/safeplane/secrets/github_token'
+done
+echo "GitHub credential is mounted only into the harness"
+
+for service in model-gateway calendar-task-mcp notification-task-mcp scheduler dev-workspace-mcp dev-workspace-apply-mcp dev-check-mcp github-mock; do
+  "$COMPOSE" exec -T "$service" sh -lc 'test ! -e /data/safeplane/publication-remotes'
+done
+
+success_commit="$(create_target_repo target-success pass)"
+auto_commit="$(create_target_repo target-auto pass)"
+changed_commit="$(create_target_repo target-changed pass)"
+moved_commit="$(create_target_repo target-moved pass)"
+fail_commit="$(create_target_repo target-fail fail)"
+echo "Writable publication remotes exist only in the harness-owned test volume"
+
+response="$(post_run draft_pr-success 'Adjust the fixture greeting')"
+http_status="$(printf '%s\n' "$response" | head -1)"
+body="$(printf '%s\n' "$response" | tail -n +2)"
+[[ "$http_status" =~ ^2[0-9][0-9]$ ]] || { printf '%s\n' "$body" >&2; exit 1; }
+run_success="$(run_id_from_success_response "$body")"
+
+"$COMPOSE" exec -T harness python3 - "$run_success" "$success_commit" "$skill_commit" <<'PY'
+import json, pathlib, sys
+run_id,target_commit,skill_commit=sys.argv[1:]
+home=pathlib.Path('/data/safeplane'); root=home/'workspaces'/run_id; pipe=root/'pipeline'
+run=json.loads((home/'runs'/f'{run_id}.json').read_text())
+state=json.loads((pipe/'pipeline.json').read_text())
+request=json.loads((pipe/'remote-approval-request.json').read_text())
+assert state['current_state']=='waiting_for_remote_approval', state
+assert run['developer_pipeline']['remote_approval_possible'] is True, run
+assert request['base_commit']==target_commit, request
+assert request['repository_name']=='fixture/target', request
+assert request['branch_name'].startswith('safeplane/'), request
+binding=run['developer_pipeline']['remote_approval_binding']
+assert request['workspace_tree_sha256']==binding['workspace_tree_sha256']
+assert request['checks_sha256']==binding['checks_sha256']
+assert request['review_sha256']==binding['review_sha256']
+assert request['credential_profile']=='github', request
+assert request['git_author_name']=='Safeplane fixture', request
+assert request['git_author_email']=='safeplane-fixture@example.invalid', request
+assert json.loads((pipe/'baseline_documentation.json').read_text())['skill_source_commit']==skill_commit
+assert json.loads((pipe/'final_documentation.json').read_text())['skill_source_commit']==skill_commit
+PY
+
+approval_response="$(approve_run "$run_success" cli)"
+approval_status="$(printf '%s\n' "$approval_response" | head -1)"
+approval_body="$(printf '%s\n' "$approval_response" | tail -n +2)"
+[[ "$approval_status" =~ ^2[0-9][0-9]$ ]] || { printf '%s\n' "$approval_body" >&2; exit 1; }
+read -r branch commit_sha pr_url approval_id < <(python3 - "$approval_body" <<'PY'
+import json,sys
+row=json.loads(sys.argv[1])
+assert row['status']=='completed' and row['draft'] is True, row
+print(row['branch_name'], row['commit_sha'], row['pull_request_url'], row['approval_id'])
+PY
+)
+
+[[ "$(remote_git target-success rev-parse refs/heads/main)" == "$success_commit" ]]
+[[ "$(remote_git target-success rev-parse "refs/heads/$branch")" == "$commit_sha" ]]
+[[ "$(remote_git target-success show "$commit_sha:src/greeter.py")" == *"Hello from the developer pipeline"* ]]
+[[ "$(remote_git target-success show -s --format='%an <%ae>' "$commit_sha")" == "Safeplane fixture <safeplane-fixture@example.invalid>" ]]
+echo "Explicit approval pushed deterministic branch without moving the base branch"
+
+duplicate_response="$(approve_run "$run_success" telegram)"
+duplicate_status="$(printf '%s\n' "$duplicate_response" | head -1)"
+duplicate_body="$(printf '%s\n' "$duplicate_response" | tail -n +2)"
+[[ "$duplicate_status" =~ ^2[0-9][0-9]$ ]]
+python3 - "$approval_body" "$duplicate_body" <<'PY'
+import json,sys
+first=json.loads(sys.argv[1]); second=json.loads(sys.argv[2])
+assert first==second, (first,second)
+PY
+
+python3 - "$SAFEPLANE_HOME/mock-github/state.json" "$run_success" "$branch" "$pr_url" <<'PY'
+import json,pathlib,sys
+state=json.loads(pathlib.Path(sys.argv[1]).read_text())
+run_id,branch,pr_url=sys.argv[2:]
+assert len(state['pulls'])==1, state
+pr=state['pulls'][0]
+assert pr['draft'] is True and pr['state']=='open', pr
+assert pr['head']==branch and pr['base']=='main', pr
+assert pr['html_url']==pr_url, pr
+body=pr['body']
+for expected in ['## Safeplane evidence', run_id, 'Review verdict: `LGTM`', 'Controlled checks: `passed`', '### Changed paths', '`src/greeter.py`', '### Model execution', 'Human inspection is required', 'does not merge']:
+    assert expected in body, (expected,body)
+assert all('/merge' not in item['path'] for item in state['requests']), state
+assert all(item['authorization_present'] for item in state['requests'] if item['path'].startswith('/repos/')), state
+assert sum(1 for item in state['requests'] if item['method']=='POST' and item['path'].endswith('/pulls'))==1, state
+PY
+echo "Duplicate approval reused one branch and one draft pull request: $pr_url"
+
+if grep -R -F 'github_pat_draft_pr_fixture_token_not_real' \
+  "$SAFEPLANE_HOME/workspaces" "$SAFEPLANE_HOME/runs" "$SAFEPLANE_HOME/logs" \
+  2>/dev/null; then
+  echo "GitHub token leaked into runtime evidence" >&2
+  exit 1
+fi
+if grep -R -F 'github_pat_draft_pr_fixture_token_not_real' \
+  "$SAFEPLANE_HOME/workspaces/$run_success/repo/.git" 2>/dev/null; then
+  echo "GitHub token leaked into target Git metadata" >&2
+  exit 1
+fi
+echo "GitHub credential is absent from Git config, traces, run records, and evidence"
+
+response="$(post_run draft_pr-success '[safeplane-fake-scenario:review_changes_requested] Adjust the fixture greeting')"
+status="$(printf '%s\n' "$response" | head -1)"; body="$(printf '%s\n' "$response" | tail -n +2)"
+[[ "$status" =~ ^2[0-9][0-9]$ ]]
+run_changes="$(run_id_from_success_response "$body")"
+blocked="$(approve_run "$run_changes")"
+[[ "$(printf '%s\n' "$blocked" | head -1)" == "409" ]]
+assert_no_run_branch target-success "$run_changes"
+echo "REQUEST_CHANGES blocked remote approval"
+
+response="$(post_run draft_pr-fail 'Adjust the fixture greeting')"
+status="$(printf '%s\n' "$response" | head -1)"
+[[ "$status" == "500" ]]
+run_failed="$(latest_run_for_profile draft_pr-fail)"
+blocked="$(approve_run "$run_failed")"
+[[ "$(printf '%s\n' "$blocked" | head -1)" == "409" ]]
+assert_no_run_branch target-fail "$run_failed"
+echo "Failed checks blocked remote approval"
+
+response="$(post_run draft_pr-changed 'Adjust the fixture greeting')"
+status="$(printf '%s\n' "$response" | head -1)"; body="$(printf '%s\n' "$response" | tail -n +2)"
+[[ "$status" =~ ^2[0-9][0-9]$ ]]
+run_changed="$(run_id_from_success_response "$body")"
+"$COMPOSE" exec -T harness python3 - "$run_changed" <<'PY'
+from pathlib import Path
+import sys
+from harness.patch_approval_store import make_tree_removable
+from harness.developer_workspace import make_tree_read_only
+repo=Path('/data/safeplane/workspaces')/sys.argv[1]/'repo'
+make_tree_removable(repo)
+(repo/'operator-tamper.txt').write_text('changed after approval request\n', encoding='utf-8')
+make_tree_read_only(repo)
+PY
+blocked="$(approve_run "$run_changed")"
+[[ "$(printf '%s\n' "$blocked" | head -1)" == "409" ]]
+assert_no_run_branch target-changed "$run_changed"
+echo "Changed workspace blocked remote approval"
+
+response="$(post_run draft_pr-moved 'Adjust the fixture greeting')"
+status="$(printf '%s\n' "$response" | head -1)"; body="$(printf '%s\n' "$response" | tail -n +2)"
+[[ "$status" =~ ^2[0-9][0-9]$ ]]
+run_moved="$(run_id_from_success_response "$body")"
+"$COMPOSE" exec -T harness sh -lc '
+set -e
+mover=/tmp/mover-work
+rm -rf "$mover"
+git clone -q /data/safeplane/publication-remotes/target-moved.git "$mover"
+git -C "$mover" config user.name "Remote mover"
+git -C "$mover" config user.email "mover@example.invalid"
+printf "%s\n" moved > "$mover/base-moved.txt"
+git -C "$mover" add .
+git -C "$mover" commit -qm "move base"
+git -C "$mover" push -q origin main
+'
+blocked="$(approve_run "$run_moved")"
+[[ "$(printf '%s\n' "$blocked" | head -1)" == "409" ]]
+assert_no_run_branch target-moved "$run_moved"
+echo "Incompatible moved base blocked remote approval"
+
+response="$(post_run draft_pr-auto 'Adjust the fixture greeting')"
+status="$(printf '%s\n' "$response" | head -1)"; body="$(printf '%s\n' "$response" | tail -n +2)"
+[[ "$status" =~ ^2[0-9][0-9]$ ]] || { printf '%s\n' "$body" >&2; exit 1; }
+run_auto="$(run_id_from_success_response "$body")"
+"$COMPOSE" exec -T harness python3 - "$run_auto" <<'PY_AUTO'
+import json,pathlib,sys
+home=pathlib.Path('/data/safeplane'); run_id=sys.argv[1]
+run=json.loads((home/'runs'/f'{run_id}.json').read_text())
+state=json.loads((home/'workspaces'/run_id/'pipeline/pipeline.json').read_text())
+assert state['current_state']=='completed', state
+assert run.get('remote_write',{}).get('draft') is True, run
+assert str(run.get('remote_write',{}).get('pull_request_url') or '').startswith('https://'), run
+assert 'did not merge' in str(run.get('final_message') or '').lower(), run
+PY_AUTO
+auto_branch="safeplane/${run_auto#run_}"
+[[ "$(remote_git target-auto rev-parse refs/heads/main)" == "$auto_commit" ]]
+remote_git target-auto show-ref --verify --quiet "refs/heads/$auto_branch"
+echo "Automatic policy created a draft pull request without a pre-PR approval step: run=$run_auto"
+
+"$COMPOSE" exec -T harness python3 - "$run_success" "$approval_id" "$pr_url" <<'PY'
+import json,pathlib,sys
+run_id,approval_id,pr_url=sys.argv[1:]
+home=pathlib.Path('/data/safeplane')
+run=json.loads((home/'runs'/f'{run_id}.json').read_text())
+state=json.loads((home/'workspaces'/run_id/'pipeline/pipeline.json').read_text())
+approval=json.loads((home/'workspaces'/run_id/'remote-approvals'/f'{approval_id}.json').read_text())
+assert state['current_state']=='completed', state
+assert state['completed_stages'][-1]=='remote_write', state
+assert run['developer_pipeline']['remote_approval_possible'] is False, run
+assert run['remote_write']['pull_request_url']==pr_url, run
+assert approval['status']=='completed' and approval['attempt_count']==1, approval
+assert approval['pull_request']['draft'] is True, approval
+assert 'merge' not in json.dumps(approval).lower(), approval
+PY
+
+echo "OK: draft pull requests are created automatically only for opt-in profiles; manual retry remains idempotent and Safeplane never merges"

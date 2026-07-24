@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+tests/scripts/compose-safeplane-notifications config --quiet
+tests/scripts/compose-safeplane-notifications config | grep -n "scheduler\|notification-task-mcp\|calendar-task-mcp\|harness\|model-gateway" | head -120

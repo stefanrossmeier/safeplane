@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT"
+
+python3 -m pytest -q \
+  tests/unit/test_runtime_security_boundaries.py \
+  tests/unit/test_secret_boundaries.py \
+  tests/unit/test_developer_compose_security.py
+
+command -v docker >/dev/null 2>&1 || {
+  echo "docker is required for running-container hardening acceptance" >&2
+  exit 2
+}
+docker compose version >/dev/null 2>&1 || {
+  echo "docker compose is required for running-container hardening acceptance" >&2
+  exit 2
+}
+
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/safeplane-runtime-hardening.XXXXXX")"
+export SAFEPLANE_HOME="$TMP_ROOT/runtime"
+export SAFEPLANE_SECRET_ROOT="$TMP_ROOT/secrets"
+export SAFEPLANE_HARNESS_PORT="18796"
+PROJECT="safeplane-runtime-hardening-$$"
+CORE_PROJECT="safeplane-runtime-hardening-core-$$"
+
+OPENROUTER_VALUE="safeplane-hardening-openrouter-$$-$RANDOM"
+GITHUB_VALUE="safeplane-hardening-github-$$-$RANDOM"
+TELEGRAM_VALUE="safeplane-hardening-telegram-$$-$RANDOM"
+TELEGRAM_USERS_VALUE="123456789"
+
+cleanup() {
+  docker compose -p "$PROJECT" \
+    -f docker-compose.yml \
+    -f docker-compose.local.yml \
+    -f docker-compose.real.yml \
+    -f docker-compose.telegram.yml \
+    -f docker-compose.github.yml \
+    down --volumes --remove-orphans >/dev/null 2>&1 || true
+  docker compose -p "$CORE_PROJECT" \
+    -f docker-compose.yml \
+    -f docker-compose.local.yml \
+    down --volumes --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "$TMP_ROOT"
+}
+trap cleanup EXIT
+
+./scripts/prepare-runtime-layout >/dev/null
+printf '%s\n' "$OPENROUTER_VALUE" > "$SAFEPLANE_SECRET_ROOT/openrouter_api_key"
+printf '%s\n' "$GITHUB_VALUE" > "$SAFEPLANE_SECRET_ROOT/github_token"
+printf '%s\n' "$TELEGRAM_VALUE" > "$SAFEPLANE_SECRET_ROOT/telegram_bot_token"
+printf '%s\n' "$TELEGRAM_USERS_VALUE" > "$SAFEPLANE_SECRET_ROOT/telegram_allowed_user_ids"
+chmod 644 "$SAFEPLANE_SECRET_ROOT"/*
+
+COMPOSE=(
+  docker compose -p "$PROJECT"
+  -f docker-compose.yml
+  -f docker-compose.local.yml
+  -f docker-compose.real.yml
+  -f docker-compose.telegram.yml
+  -f docker-compose.github.yml
+)
+
+"${COMPOSE[@]}" config > "$TMP_ROOT/rendered-compose.yml"
+python3 - "$TMP_ROOT/rendered-compose.yml" "$OPENROUTER_VALUE" "$GITHUB_VALUE" "$TELEGRAM_VALUE" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+for value in sys.argv[2:]:
+    if value in text:
+        raise SystemExit("secret value leaked into rendered Compose configuration")
+compose = yaml.safe_load(text)
+services = compose["services"]
+for name, service in services.items():
+    for value in (service.get("environment") or {}).values():
+        if any(secret in str(value) for secret in sys.argv[2:]):
+            raise SystemExit(f"secret value leaked into {name} environment")
+ports = services["harness"].get("ports") or []
+assert ports and all(str(item.get("host_ip")) == "127.0.0.1" for item in ports), ports
+for name, service in services.items():
+    if name != "harness":
+        assert not service.get("ports"), (name, service.get("ports"))
+print("Rendered Compose policy is secret-free and loopback-only")
+PY
+
+"${COMPOSE[@]}" build \
+  harness model-gateway calendar-task-mcp scheduler notification-task-mcp telegram-connector
+"${COMPOSE[@]}" create
+
+python3 - "$PROJECT" <<'PY'
+from __future__ import annotations
+import json
+import subprocess
+import sys
+
+project = sys.argv[1]
+services = (
+    "harness",
+    "model-gateway",
+    "calendar-task-mcp",
+    "scheduler",
+    "notification-task-mcp",
+    "telegram-connector",
+)
+expected_networks = {
+    "harness": {"harness-egress", "harness-model", "harness-tools", "connector-harness"},
+    "model-gateway": {"model-egress", "harness-model"},
+    "calendar-task-mcp": {"harness-tools"},
+    "scheduler": {"notification-delivery"},
+    "notification-task-mcp": {"harness-tools", "notification-delivery"},
+    "telegram-connector": {"telegram-egress", "connector-harness", "notification-delivery"},
+}
+for service in services:
+    container_id = subprocess.check_output(
+        ["docker", "compose", "-p", project,
+         "-f", "docker-compose.yml", "-f", "docker-compose.local.yml",
+         "-f", "docker-compose.real.yml", "-f", "docker-compose.telegram.yml",
+         "-f", "docker-compose.github.yml", "ps", "-aq", service],
+        text=True,
+    ).strip()
+    assert container_id, service
+    info = json.loads(subprocess.check_output(["docker", "inspect", container_id], text=True))[0]
+    assert info["Config"]["User"] == "10001:10001", (service, info["Config"]["User"])
+    host = info["HostConfig"]
+    assert host["ReadonlyRootfs"] is True, service
+    assert "ALL" in (host.get("CapDrop") or []), service
+    assert any("no-new-privileges" in item for item in (host.get("SecurityOpt") or [])), service
+    assert int(host.get("PidsLimit") or 0) > 0, service
+    networks = {
+        name.removeprefix(project + "_")
+        for name in info["NetworkSettings"]["Networks"]
+    }
+    assert networks == expected_networks[service], (service, networks)
+    env = "\n".join(info["Config"].get("Env") or [])
+    for marker in ("safeplane-hardening-openrouter", "safeplane-hardening-github", "safeplane-hardening-telegram"):
+        assert marker not in env, (service, marker)
+print("Created containers enforce user, rootfs, capability, process, network, and environment policy")
+PY
+
+hash_file() {
+  python3 - "$1" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+print(sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+}
+
+container_hash() {
+  local service="$1"
+  local path="$2"
+  "${COMPOSE[@]}" run --rm --no-deps --entrypoint python "$service" -c \
+    'from hashlib import sha256; from pathlib import Path; import sys; print(sha256(Path(sys.argv[1]).read_bytes()).hexdigest())' \
+    "$path" | tail -n 1
+}
+
+[[ "$(container_hash model-gateway /run/secrets/openrouter_api_key)" == "$(hash_file "$SAFEPLANE_SECRET_ROOT/openrouter_api_key")" ]]
+[[ "$(container_hash harness /run/secrets/github_token)" == "$(hash_file "$SAFEPLANE_SECRET_ROOT/github_token")" ]]
+[[ "$(container_hash telegram-connector /run/secrets/telegram_bot_token)" == "$(hash_file "$SAFEPLANE_SECRET_ROOT/telegram_bot_token")" ]]
+[[ "$(container_hash telegram-connector /run/secrets/telegram_allowed_user_ids)" == "$(hash_file "$SAFEPLANE_SECRET_ROOT/telegram_allowed_user_ids")" ]]
+echo "Intended services can read only their named Docker secrets"
+
+check_secret_matrix() {
+  local service="$1"
+  shift
+  "${COMPOSE[@]}" run --rm --no-deps --entrypoint python "$service" - "$@" <<'PY'
+from pathlib import Path
+import sys
+all_names = {
+    "openrouter_api_key",
+    "github_token",
+    "telegram_bot_token",
+    "telegram_allowed_user_ids",
+}
+expected = set(sys.argv[1:])
+visible = {name for name in all_names if (Path("/run/secrets") / name).exists()}
+if visible != expected:
+    raise SystemExit(f"secret visibility mismatch: visible={sorted(visible)} expected={sorted(expected)}")
+print("secret matrix ok")
+PY
+}
+
+check_secret_matrix harness github_token
+check_secret_matrix model-gateway openrouter_api_key
+check_secret_matrix telegram-connector telegram_bot_token telegram_allowed_user_ids
+check_secret_matrix calendar-task-mcp
+check_secret_matrix notification-task-mcp
+check_secret_matrix scheduler
+echo "Unintended services cannot see secret paths"
+
+"${COMPOSE[@]}" run --rm --no-deps --entrypoint python harness - <<'PY'
+from pathlib import Path
+for relative in ("sessions", "runs", "traces", "workspaces", "logs/mcp"):
+    path = Path("/data/safeplane") / relative / "runtime-hardening-write-probe"
+    path.write_text("ok", encoding="utf-8")
+assert not Path("/data/safeplane/secrets").exists()
+PY
+"${COMPOSE[@]}" run --rm --no-deps --entrypoint python scheduler - <<'PY'
+from pathlib import Path
+(Path("/data/safeplane/data/notifications") / "runtime-hardening-write-probe").write_text("ok", encoding="utf-8")
+(Path("/data/safeplane/logs/scheduler") / "runtime-hardening-write-probe").write_text("ok", encoding="utf-8")
+calendar = Path("/data/safeplane/data/calendar") / "runtime-hardening-read-only-probe"
+try:
+    calendar.write_text("should fail", encoding="utf-8")
+except OSError:
+    pass
+else:
+    raise SystemExit("scheduler calendar mount is unexpectedly writable")
+PY
+echo "Services can write only declared runtime state; scheduler calendar mount is read-only"
+
+IMAGE_IDS="$("${COMPOSE[@]}" images -q | sort -u)"
+for image in $IMAGE_IDS; do
+  history="$(docker history --no-trunc "$image")"
+  for value in "$OPENROUTER_VALUE" "$GITHUB_VALUE" "$TELEGRAM_VALUE"; do
+    if grep -Fq "$value" <<<"$history"; then
+      echo "secret value leaked into image history: $image" >&2
+      exit 1
+    fi
+  done
+done
+echo "Image history contains no test secret values"
+
+"${COMPOSE[@]}" down --volumes --remove-orphans >/dev/null
+
+CORE=(docker compose -p "$CORE_PROJECT" -f docker-compose.yml -f docker-compose.local.yml)
+"${CORE[@]}" up -d --build
+for _ in $(seq 1 60); do
+  if curl -fsS "http://127.0.0.1:${SAFEPLANE_HARNESS_PORT}/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+curl -fsS "http://127.0.0.1:${SAFEPLANE_HARNESS_PORT}/health" >/dev/null
+python3 - "$CORE_PROJECT" <<'PY'
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+
+project = sys.argv[1]
+compose = [
+    "docker", "compose", "-p", project,
+    "-f", "docker-compose.yml", "-f", "docker-compose.local.yml",
+]
+services = (
+    "harness",
+    "model-gateway",
+    "calendar-task-mcp",
+    "scheduler",
+    "notification-task-mcp",
+)
+
+
+def inspect_services() -> dict[str, dict[str, object]]:
+    result: dict[str, dict[str, object]] = {}
+    for service in services:
+        cid = subprocess.check_output(
+            [*compose, "ps", "-q", service],
+            text=True,
+        ).strip()
+        if not cid:
+            result[service] = {
+                "container_status": "missing",
+                "health_status": "missing",
+                "exit_code": None,
+            }
+            continue
+
+        info = json.loads(
+            subprocess.check_output(["docker", "inspect", cid], text=True)
+        )[0]
+        state = info.get("State") or {}
+        health = state.get("Health") or {}
+        result[service] = {
+            "container_status": state.get("Status") or "unknown",
+            "health_status": health.get("Status") or "none",
+            "exit_code": state.get("ExitCode"),
+        }
+    return result
+
+
+def print_diagnostics(states: dict[str, dict[str, object]]) -> None:
+    print("Core service health states:", file=sys.stderr)
+    for service in services:
+        print(f"- {service}: {states.get(service)}", file=sys.stderr)
+    subprocess.run([*compose, "ps"], check=False)
+    subprocess.run(
+        [*compose, "logs", "--no-color", "--tail", "100", *services],
+        check=False,
+    )
+
+
+deadline = time.monotonic() + 90
+last = inspect_services()
+while True:
+    if all(
+        item.get("container_status") == "running"
+        and item.get("health_status") == "healthy"
+        for item in last.values()
+    ):
+        break
+
+    failed = {
+        service: item
+        for service, item in last.items()
+        if item.get("container_status") in {"exited", "dead", "removing", "missing"}
+        or item.get("health_status") == "unhealthy"
+    }
+    if failed:
+        print_diagnostics(last)
+        raise SystemExit(f"core service failed before becoming healthy: {failed}")
+
+    if time.monotonic() >= deadline:
+        print_diagnostics(last)
+        raise SystemExit(f"core services did not become healthy within 90 seconds: {last}")
+
+    time.sleep(1)
+    last = inspect_services()
+
+print("Hardened fake-mode core stack is healthy")
+PY
+
+echo "OK: secret, mount, network, port, user, rootfs, capability, and health boundaries passed"

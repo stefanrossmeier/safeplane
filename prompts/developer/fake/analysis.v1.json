@@ -1,0 +1,11 @@
+{
+  "requirements_markdown": "# Requirements\n\n## Goal\nAdd a bounded greeting option to the fixture repository.\n\n## Scope\nChange the greeting function and its focused test.\n\n## Non-Goals\nNo deployment, release, or unrelated refactoring.\n\n## Acceptance Criteria\nThe focused tests pass and unrelated output remains unchanged.",
+  "architecture_tasks_markdown": "# Architecture Tasks\n\n1. Update the greeting behavior in the existing implementation file.\n2. Add or update focused test coverage.\n3. Run the declared fixture checks.",
+  "assumptions": [
+    "The fixture repository remains the target for developer workflow contract fake validation."
+  ],
+  "open_questions": [],
+  "scope_risks": [
+    "Unrelated formatting changes would exceed the approved scope."
+  ]
+}

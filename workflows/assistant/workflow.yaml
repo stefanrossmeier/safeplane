@@ -1,0 +1,55 @@
+workflow_id: assistant
+version: 0.1.0
+description: Personal assistant foundation for planning, organizing, and text-only
+  assistance.
+supported_entrypoints:
+- assistant
+examples:
+- Help me plan today
+- Draft a short checklist for this task
+prompt:
+  id: assistant.system
+  version: v1
+  path: /app/prompts/assistant/system.v1.md
+model_profiles:
+  default:
+    litellm_model: openrouter/openrouter/free
+    temperature: 0.3
+    max_tokens: 1000
+session:
+  receives_history: true
+concurrency:
+  same_session: serial
+  different_sessions: parallel_allowed_later
+runtime_context:
+  timezone: Europe/Berlin
+mcp:
+  servers:
+  - notification
+  - calendar
+  max_tool_call_retries: 5
+  allowed_servers:
+    calendar:
+      tools:
+      - calendar_list
+      - calendar_create
+      - calendar_cancel
+    notification:
+      tools:
+      - notification_schedule
+      - notification_list
+      - notification_cancel
+tools:
+  enabled: false
+  allowed: []
+functions:
+  enabled: false
+  allowed: []
+io:
+  input:
+    messages: list
+  output:
+    final_message: string
+deterministic_tools:
+  enabled:
+  - calendar

@@ -1,0 +1,5 @@
+{
+  "title": "Adjust fixture greeting",
+  "body_markdown": "## Summary\n\n- Adjust the fixture greeting through the staged developer workflow.\n- Keep the change within one file and one hunk.\n\n## Checks\n\n- `python3 checks/check_greeting.py` (controlled MCP evidence)\n\n## Documentation\n\nNo architecture-document update was required.\n\n## Review\n\nSafeplane review verdict: LGTM. Human inspection is still required before any remote write.",
+  "draft": true
+}

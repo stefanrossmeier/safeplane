@@ -1,0 +1,7 @@
+{
+  "implementation_summary_markdown": "# Implementation Summary\n\nPrepared a one-line fixture greeting change inside the approved plan.",
+  "unified_diff": "diff --git a/src/greeter.py b/src/greeter.py\n--- a/src/greeter.py\n+++ b/src/greeter.py\n@@ -1,2 +1,2 @@\n def greet(name: str) -> str:\n-    return f\"Hello, {name}!\"\n+    return f\"Hello from the developer pipeline, {name}!\"\n",
+  "changed_files": [
+    "src/greeter.py"
+  ]
+}

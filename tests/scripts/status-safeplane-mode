@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+known_services=(
+  harness
+  model-gateway
+  calendar-task-mcp
+  notification-task-mcp
+  scheduler
+  telegram-connector
+  dev-workspace-mcp
+  dev-workspace-apply-mcp
+  dev-check-mcp
+)
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+container_label() {
+  local container_id="$1"
+  local label_name="$2"
+
+  docker inspect \
+    --format "{{ index .Config.Labels \"${label_name}\" }}" \
+    "$container_id" 2>/dev/null || true
+}
+
+container_state() {
+  local container_id="$1"
+  docker inspect --format '{{.State.Status}}' "$container_id" 2>/dev/null || true
+}
+
+container_env_value() {
+  local container_id="$1"
+  local env_name="$2"
+
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_id" 2>/dev/null \
+    | awk -F= -v name="$env_name" '$1 == name {sub(/^[^=]*=/, ""); print; exit}'
+}
+
+normalize_compose_files() {
+  local raw="$1"
+
+  printf '%s\n' "$raw" | awk -F, '
+    {
+      for (i = 1; i <= NF; i++) {
+        value = $i
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        count = split(value, parts, "/")
+        if (value != "") {
+          if (printed) {
+            printf ","
+          }
+          printf "%s", parts[count]
+          printed = 1
+        }
+      }
+      printf "\n"
+    }
+  '
+}
+
+service_container_id() {
+  local project="$1"
+  local service="$2"
+
+  docker ps --all --quiet \
+    --filter "label=com.docker.compose.project=${project}" \
+    --filter "label=com.docker.compose.service=${service}" \
+    | head -n 1
+}
+
+service_health() {
+  local container_id="$1"
+  local state="$2"
+
+  if [[ "$state" != "running" ]]; then
+    printf '%s' '-'
+    return
+  fi
+
+  if docker exec "$container_id" python -c \
+    'import urllib.request; response = urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=3); raise SystemExit(0 if response.status == 200 else 1)' \
+    >/dev/null 2>&1; then
+    printf '%s' 'ok'
+  elif docker exec "$container_id" python -c \
+    'import socket; path="/run/safeplane-dev-check/dev-check.sock"; client=socket.socket(socket.AF_UNIX); client.settimeout(3); client.connect(path); client.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"); data=client.recv(128); client.close(); raise SystemExit(0 if b" 200 " in data else 1)' \
+    >/dev/null 2>&1; then
+    printf '%s' 'ok'
+  else
+    printf '%s' 'failed'
+  fi
+}
+
+configured_workflow_model() {
+  local workflow_id="$1"
+  awk '
+    /^model_profiles:/ { in_profiles = 1; next }
+    in_profiles && /^  default:/ { in_default = 1; next }
+    in_default && /litellm_model:/ { print $2; exit }
+  ' "workflows/${workflow_id}/workflow.yaml"
+}
+
+likely_helper() {
+  local compose_files="$1"
+
+  if [[ "$compose_files" == *"docker-compose.developer.yml"* ]]; then
+    if [[ "$compose_files" == *"docker-compose.telegram.yml"* ]]; then
+      printf '%s' 'custom developer + Telegram overlay combination'
+    elif [[ "$compose_files" == *"docker-compose.github.yml"* && "$compose_files" == *"docker-compose.real.yml"* ]]; then
+      printf '%s' 'tests/scripts/compose-safeplane-developer-github-real'
+    elif [[ "$compose_files" == *"docker-compose.github.yml"* ]]; then
+      printf '%s' 'tests/scripts/compose-safeplane-developer-github-fake'
+    elif [[ "$compose_files" == *"docker-compose.real.yml"* ]]; then
+      printf '%s' 'tests/scripts/compose-safeplane-developer-real'
+    else
+      printf '%s' 'tests/scripts/compose-safeplane-developer-fake'
+    fi
+    return
+  fi
+
+  if [[ "$compose_files" == *"docker-compose.telegram.yml"* ]]; then
+    if [[ "$compose_files" == *"docker-compose.real.yml"* ]]; then
+      printf '%s' 'tests/scripts/compose-safeplane-telegram-real'
+    else
+      printf '%s' 'tests/scripts/compose-safeplane-telegram-fake'
+    fi
+    return
+  fi
+
+  if [[ "$compose_files" == *"docker-compose.real.yml"* ]]; then
+    printf '%s' 'tests/scripts/compose-safeplane-real'
+  else
+    printf '%s' 'tests/scripts/compose-safeplane-fake'
+  fi
+}
+
+command -v docker >/dev/null 2>&1 || fail "docker is not installed or not on PATH"
+docker compose version >/dev/null 2>&1 || fail "docker compose is unavailable"
+docker info >/dev/null 2>&1 || fail "Docker is installed, but the daemon is not reachable"
+
+reference_id=""
+for service in model-gateway harness scheduler calendar-task-mcp notification-task-mcp; do
+  reference_id="$(docker compose -f docker-compose.yml ps --all --quiet "$service" 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$reference_id" ]]; then
+    break
+  fi
+done
+
+if [[ -z "$reference_id" ]]; then
+  echo "Safeplane runtime status"
+  echo
+  echo "No Safeplane containers are currently created for this Compose project."
+  echo
+  echo "Start one of:"
+  echo "  tests/scripts/compose-safeplane-fake up -d"
+  echo "  tests/scripts/compose-safeplane-real up -d"
+  echo "  tests/scripts/compose-safeplane-telegram-fake up -d"
+  echo "  tests/scripts/compose-safeplane-telegram-real up -d"
+  echo "  tests/scripts/compose-safeplane-developer-fake up -d"
+  echo "  tests/scripts/compose-safeplane-developer-real up -d"
+  echo "  tests/scripts/compose-safeplane-developer-github-fake up -d"
+  echo "  tests/scripts/compose-safeplane-developer-github-real up -d"
+  exit 0
+fi
+
+project="$(container_label "$reference_id" 'com.docker.compose.project')"
+[[ -n "$project" ]] || fail "could not determine the Docker Compose project"
+
+status_tmp="$(mktemp)"
+trap 'rm -f "$status_tmp"' EXIT
+
+for service in "${known_services[@]}"; do
+  container_id="$(service_container_id "$project" "$service")"
+  if [[ -z "$container_id" ]]; then
+    continue
+  fi
+
+  raw_files="$(container_label "$container_id" 'com.docker.compose.project.config_files')"
+  compose_files="$(normalize_compose_files "$raw_files")"
+  printf '%s|%s\n' "$service" "${compose_files:-unknown}" >> "$status_tmp"
+done
+
+unique_config_count="$(cut -d'|' -f2- "$status_tmp" | sort -u | sed '/^$/d' | wc -l | tr -d ' ')"
+
+model_id="$(service_container_id "$project" model-gateway)"
+model_state="not-created"
+model_mode="unknown"
+openrouter_secret="not-applicable"
+
+if [[ -n "$model_id" ]]; then
+  model_state="$(container_state "$model_id")"
+  model_mode="$(container_env_value "$model_id" MODEL_GATEWAY_MODE)"
+  model_mode="${model_mode:-fake}"
+
+  if [[ "$model_mode" == "real" ]]; then
+    if [[ "$model_state" == "running" ]]; then
+      if docker exec "$model_id" test -s /run/secrets/openrouter_api_key >/dev/null 2>&1; then
+        openrouter_secret="yes"
+      else
+        openrouter_secret="no"
+      fi
+    else
+      openrouter_secret="unknown (model-gateway is not running)"
+    fi
+  fi
+fi
+
+scheduler_id="$(service_container_id "$project" scheduler)"
+scheduler_connectors="not-created"
+if [[ -n "$scheduler_id" ]]; then
+  scheduler_connectors="$(container_env_value "$scheduler_id" SAFEPLANE_NOTIFICATION_CONNECTORS)"
+  scheduler_connectors="${scheduler_connectors:-log}"
+fi
+
+telegram_id="$(service_container_id "$project" telegram-connector)"
+telegram_state="not-created"
+if [[ -n "$telegram_id" ]]; then
+  telegram_state="$(container_state "$telegram_id")"
+fi
+
+harness_id="$(service_container_id "$project" harness)"
+harness_port="not published"
+github_secret="not-mounted"
+if [[ -n "$harness_id" ]]; then
+  published_port="$(docker port "$harness_id" 8080/tcp 2>/dev/null | paste -sd, - || true)"
+  if [[ -n "$published_port" ]]; then
+    harness_port="$published_port"
+  fi
+  if [[ "$(container_state "$harness_id")" == "running" ]]; then
+    if docker exec "$harness_id" test -s /run/secrets/github_token >/dev/null 2>&1; then
+      github_secret="yes"
+    else
+      github_secret="no"
+    fi
+  else
+    github_secret="unknown (harness is not running)"
+  fi
+fi
+
+echo "Safeplane runtime status"
+echo
+echo "Compose project: $project"
+
+if [[ "$unique_config_count" == "1" ]]; then
+  active_files="$(cut -d'|' -f2- "$status_tmp" | head -n 1)"
+  echo "Compose files: $active_files"
+  echo "Likely helper: $(likely_helper "$active_files")"
+else
+  echo "Compose files: mixed service definitions detected"
+  echo "Likely helper: none; services were created with different Compose combinations"
+  while IFS='|' read -r service compose_files; do
+    printf '  %-24s %s\n' "$service" "$compose_files"
+  done < "$status_tmp"
+fi
+
+echo
+echo "Runtime mode"
+printf '  %-28s %s\n' "model-gateway mode:" "$model_mode"
+printf '  %-28s %s\n' "assistant configured model:" "$(configured_workflow_model assistant)"
+printf '  %-28s %s\n' "developer configured model:" "$(configured_workflow_model developer)"
+printf '  %-28s %s\n' "OpenRouter secret mounted:" "$openrouter_secret"
+printf '  %-28s %s\n' "GitHub secret mounted:" "$github_secret"
+printf '  %-28s %s\n' "scheduler connectors:" "$scheduler_connectors"
+printf '  %-28s %s\n' "Telegram connector:" "$telegram_state"
+
+if [[ -n "$model_id" ]]; then
+  echo
+  echo "Developer model profile overrides"
+  for profile in \
+    DEVELOPER_DOCUMENTATION \
+    DEVELOPER_ANALYSIS \
+    DEVELOPER_PLANNING \
+    DEVELOPER_IMPLEMENTATION \
+    DEVELOPER_REVIEW \
+    DEVELOPER_PR; do
+    env_name="SAFEPLANE_MODEL_PROFILE_${profile}"
+    value="$(container_env_value "$model_id" "$env_name")"
+    printf '  %-44s %s\n' "$env_name:" "${value:-contract default}"
+  done
+fi
+
+developer_id="$(service_container_id "$project" dev-workspace-mcp)"
+developer_state="not-created"
+if [[ -n "$developer_id" ]]; then
+  developer_state="$(container_state "$developer_id")"
+fi
+printf '  %-28s %s\n' "Developer workspace MCP:" "$developer_state"
+printf '  %-28s %s\n' "harness host port:" "$harness_port"
+
+echo
+echo "Services"
+printf '  %-24s %-13s %-8s %s\n' "SERVICE" "STATE" "HEALTH" "CONTAINER"
+for service in "${known_services[@]}"; do
+  container_id="$(service_container_id "$project" "$service")"
+  if [[ -z "$container_id" ]]; then
+    printf '  %-24s %-13s %-8s %s\n' "$service" "not-created" "-" "-"
+    continue
+  fi
+
+  state="$(container_state "$container_id")"
+  health="$(service_health "$container_id" "$state")"
+  container_name="$(docker inspect --format '{{.Name}}' "$container_id" 2>/dev/null | sed 's#^/##')"
+  printf '  %-24s %-13s %-8s %s\n' "$service" "$state" "$health" "$container_name"
+done
+
+if [[ "$model_mode" == "real" && "$openrouter_secret" == "no" ]]; then
+  echo
+  echo "WARNING: model-gateway is in real mode, but the OpenRouter secret file is not mounted or is empty."
+fi
+
+if [[ "$unique_config_count" != "1" ]]; then
+  echo
+  echo "WARNING: mixed Compose definitions can mean that only part of the stack was recreated after changing modes."
+fi

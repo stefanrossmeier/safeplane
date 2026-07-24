@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+if [[ "${SAFEPLANE_CONFIRM_REAL_GITHUB_DRAFT_PR:-no}" != "yes" ]]; then
+  echo "This is a guarded manual real GitHub draft-PR smoke test." >&2
+  echo "Set SAFEPLANE_CONFIRM_REAL_GITHUB_DRAFT_PR=yes only for a dedicated test repository." >&2
+  exit 2
+fi
+
+RUN_ID="${SAFEPLANE_DRAFT_PR_RUN_ID:-}"
+EXPECTED_REPOSITORY="${SAFEPLANE_DRAFT_PR_EXPECTED_REPOSITORY:-}"
+PORT="${SAFEPLANE_HARNESS_PORT:-8787}"
+TOKEN_FILE="${SAFEPLANE_GITHUB_TOKEN_FILE:-${HOME}/.config/safeplane/secrets/github_token}"
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-github-fake"
+
+if [[ -z "$RUN_ID" || -z "$EXPECTED_REPOSITORY" ]]; then
+  echo "Set SAFEPLANE_DRAFT_PR_RUN_ID and SAFEPLANE_DRAFT_PR_EXPECTED_REPOSITORY=owner/repository." >&2
+  exit 2
+fi
+if [[ ! "$EXPECTED_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  echo "SAFEPLANE_DRAFT_PR_EXPECTED_REPOSITORY must be owner/repository." >&2
+  exit 2
+fi
+if [[ ! -s "$TOKEN_FILE" ]]; then
+  echo "GitHub token file is missing: $TOKEN_FILE" >&2
+  exit 2
+fi
+runtime_home="${SAFEPLANE_HOME:-${HOME}/.safeplane}"
+resolved_token="$(python3 - "$TOKEN_FILE" <<'PY_PATH'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve())
+PY_PATH
+)"
+resolved_home="$(python3 - "$runtime_home" <<'PY_PATH'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve())
+PY_PATH
+)"
+case "$resolved_token" in
+  "$resolved_home"|"$resolved_home"/*)
+    echo "GitHub token file must be outside SAFEPLANE_HOME: $resolved_token" >&2
+    exit 2
+    ;;
+esac
+
+export SAFEPLANE_GITHUB_TOKEN_FILE="$TOKEN_FILE"
+"$COMPOSE" up -d --build
+
+healthy=no
+for _ in $(seq 1 120); do
+  if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+    healthy=yes
+    break
+  fi
+  sleep 1
+done
+if [[ "$healthy" != "yes" ]]; then
+  "$COMPOSE" ps >&2 || true
+  "$COMPOSE" logs --tail=120 harness >&2 || true
+  echo "Harness did not become healthy." >&2
+  exit 1
+fi
+
+run_json="$(curl -fsS "http://127.0.0.1:${PORT}/runs/${RUN_ID}")"
+preflight_json="$(python3 - "$run_json" "$EXPECTED_REPOSITORY" <<'PY'
+import json,sys
+run=json.loads(sys.argv[1]); expected=sys.argv[2]
+pipeline=run.get('developer_pipeline') or {}
+binding=pipeline.get('remote_approval_binding') or {}
+workspace=run.get('repository_workspace') or {}
+target=workspace.get('target') or {}
+actual=target.get('repository_name') or binding.get('repository_name')
+state=pipeline.get('current_state')
+assert run.get('status')=='completed', run
+assert state in {'waiting_for_remote_approval','completed'}, run
+assert actual==expected, (actual,expected)
+remote=run.get('remote_write') or pipeline.get('remote_write') or {}
+if state == 'completed':
+    assert remote.get('status') == 'completed', run
+    assert remote.get('draft') is True, run
+    assert str(remote.get('pull_request_url') or '').startswith('https://github.com/'), run
+print(json.dumps({
+    'state': state,
+    'branch_name': remote.get('branch_name'),
+    'pull_request_number': remote.get('pull_request_number'),
+    'pull_request_url': remote.get('pull_request_url'),
+}, sort_keys=True))
+PY
+)"
+
+response_file="$(mktemp)"
+status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PORT}/runs/${RUN_ID}/remote/approve" \
+  -H 'Content-Type: application/json' \
+  -d '{"approved":true,"connector":"cli"}')"
+body="$(cat "$response_file")"
+rm -f "$response_file"
+if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+  printf '%s\n' "$body" >&2
+  exit 1
+fi
+python3 - "$body" "$preflight_json" <<'PY'
+import json,sys
+row=json.loads(sys.argv[1]); preflight=json.loads(sys.argv[2])
+assert row['status']=='completed', row
+assert row['draft'] is True, row
+assert row['pull_request_url'].startswith('https://github.com/'), row
+if preflight['state'] == 'completed':
+    assert row['branch_name'] == preflight['branch_name'], (row, preflight)
+    assert row['pull_request_number'] == preflight['pull_request_number'], (row, preflight)
+    assert row['pull_request_url'] == preflight['pull_request_url'], (row, preflight)
+    print(f"Draft PR reused: {row['pull_request_url']}")
+else:
+    print(f"Draft PR created: {row['pull_request_url']}")
+print(f"Branch: {row['branch_name']}")
+print("Safeplane did not merge the pull request.")
+PY

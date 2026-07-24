@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-fake"
+PROJECT="${SAFEPLANE_REPOSITORY_WORKSPACE_PROJECT:-safeplane-repository-workspace-smoke}"
+PORT="${SAFEPLANE_REPOSITORY_WORKSPACE_PORT:-8797}"
+if [[ -n "${SAFEPLANE_REPOSITORY_WORKSPACE_HOME:-}" ]]; then
+  HOME_DIR="$SAFEPLANE_REPOSITORY_WORKSPACE_HOME"
+  HOME_CREATED=no
+else
+  HOME_DIR="$(mktemp -d)"
+  HOME_CREATED=yes
+fi
+KEEP="${SAFEPLANE_REPOSITORY_WORKSPACE_KEEP:-no}"
+
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export SAFEPLANE_HOME="$HOME_DIR"
+export SAFEPLANE_HARNESS_PORT="$PORT"
+export SAFEPLANE_DEV_SOURCE="$ROOT/tests/fixtures/developer-repo"
+export SAFEPLANE_REPOSITORY_CONFIG="/data/safeplane/config/repositories.yaml"
+export SAFEPLANE_ALLOW_LOCAL_GIT_FIXTURES=yes
+
+mkdir -p "$SAFEPLANE_HOME/workspaces" "$SAFEPLANE_HOME/config" "$SAFEPLANE_HOME/git-fixtures"
+chmod 0755 "$SAFEPLANE_HOME/workspaces"
+
+cleanup() {
+  if [[ "$KEEP" != "yes" ]]; then
+    cleanup_image="$("$COMPOSE" images -q harness 2>/dev/null | head -n 1 || true)"
+    "$COMPOSE" down --remove-orphans --volumes >/dev/null 2>&1 || true
+    if [[ "$HOME_CREATED" == "yes" ]]; then
+      "$ROOT/tests/scripts/remove-container-owned-tree" "$HOME_DIR" "$cleanup_image"
+    fi
+  else
+    echo "Keeping repository workspace preparation smoke runtime: project=$PROJECT SAFEPLANE_HOME=$HOME_DIR"
+  fi
+}
+trap cleanup EXIT
+
+create_bare_repo() {
+  local name="$1"
+  local work="$SAFEPLANE_HOME/git-fixtures/${name}-work"
+  local bare="$SAFEPLANE_HOME/git-fixtures/${name}.git"
+  rm -rf "$work" "$bare"
+  mkdir -p "$work"
+  git -C "$work" init -q -b main
+  git -C "$work" config user.name "Safeplane fixture"
+  git -C "$work" config user.email "fixture@example.invalid"
+  case "$name" in
+    target)
+      mkdir -p "$work/src" "$work/checks"
+      printf '%s\n' '# repository workspace preparation target fixture' > "$work/README.md"
+      cat > "$work/src/greeter.py" <<'PY'
+def greet(name: str) -> str:
+    return f"Hello, {name}!"
+PY
+      cat > "$work/checks/check_greeting.py" <<'PY'
+from pathlib import Path
+content = Path("src/greeter.py").read_text(encoding="utf-8")
+assert "Hello from the developer pipeline" in content, content
+print("controlled greeting check passed")
+PY
+      ;;
+    skills)
+      mkdir -p "$work/skills/archdoc"
+      printf '%s\n' '# External archdoc fixture' > "$work/skills/archdoc/SKILL.md"
+      ;;
+  esac
+  git -C "$work" add .
+  git -C "$work" commit -qm "fixture"
+  git clone -q --bare "$work" "$bare"
+  git -C "$work" rev-parse HEAD
+}
+
+target_commit="$(create_bare_repo target)"
+skill_commit="$(create_bare_repo skills)"
+export SAFEPLANE_ARCHDOC_REPOSITORY_URL="file:///data/safeplane/git-fixtures/skills.git"
+
+cat > "$SAFEPLANE_HOME/config/repositories.yaml" <<'YAML'
+version: 1
+credential_profiles: {}
+repository_profiles:
+  repository_workspace-fixture:
+    enabled: true
+    repository_url: file:///data/safeplane/git-fixtures/target.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: null
+    allow_file_url: true
+    remote_write_allowed: false
+    branch_prefix: safeplane/
+YAML
+
+wait_health() {
+  local url="$1"
+  local deadline=$((SECONDS + 120))
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for $url" >&2
+      "$COMPOSE" ps >&2 || true
+      "$COMPOSE" logs harness >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+json_post() {
+  local url="$1"
+  local payload="$2"
+  curl -fsS -X POST "$url" -H 'Content-Type: application/json' -d "$payload"
+}
+
+workspace_git() {
+  local repository="$1"
+  shift
+  git -c "safe.directory=$repository" -C "$repository" "$@"
+}
+
+echo "Starting isolated repository workspace preparation external repository stack..."
+"$COMPOSE" up -d --build \
+  model-gateway calendar-task-mcp notification-task-mcp scheduler \
+  dev-workspace-mcp dev-workspace-apply-mcp harness
+wait_health "http://127.0.0.1:${PORT}/health"
+
+run_profile() {
+  local response_file http_status response
+  response_file="$(mktemp)"
+  if ! http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:${PORT}/connector/develop" \
+    -H 'Content-Type: application/json' \
+    -d '{"connector":"cli","repository_profile":"repository_workspace-fixture","message":"Inspect the external fixture through the staged fake workflow"}')"; then
+    echo "Developer run request failed before an HTTP response was received" >&2
+    cat "$response_file" >&2 || true
+    rm -f "$response_file"
+    return 1
+  fi
+  response="$(cat "$response_file")"
+  rm -f "$response_file"
+  if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+    echo "Developer run returned HTTP $http_status" >&2
+    printf '%s\n' "$response" >&2
+    return 1
+  fi
+  printf '%s' "$response"
+}
+
+response="$(run_profile)"
+run_id="$(python3 - "$response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+assert "waiting_for_remote_approval" in (response.get("final_message") or ""), response
+print(response["run_id"])
+PY
+)"
+
+manifest="$SAFEPLANE_HOME/workspaces/$run_id/workspace.json"
+pipeline_context="$SAFEPLANE_HOME/workspaces/$run_id/pipeline/repository-context.json"
+run_record="$SAFEPLANE_HOME/runs/$run_id.json"
+python3 - "$manifest" "$pipeline_context" "$run_record" "$target_commit" "$skill_commit" <<'PY'
+import json, pathlib, sys
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+context = json.loads(pathlib.Path(sys.argv[2]).read_text())
+run = json.loads(pathlib.Path(sys.argv[3]).read_text())
+target_commit, skill_commit = sys.argv[4:6]
+assert manifest["workspace_kind"] == "git_multi_repository", manifest
+assert manifest["target"]["profile_id"] == "repository_workspace-fixture", manifest
+assert manifest["target"]["resolved_commit"] == target_commit, manifest
+assert manifest["target"]["remote_write_allowed"] is False, manifest
+archdoc = manifest["external_sources"]["archdoc"]
+assert archdoc["resolved_commit"] == skill_commit, archdoc
+assert archdoc["required_path"] == "skills/archdoc", archdoc
+assert archdoc["allowed_agents"] == ["documentation"], archdoc
+assert archdoc["read_only"] is True, archdoc
+assert context["repository_profile"] == "repository_workspace-fixture", context
+assert context["base_commit"] == target_commit, context
+assert context["external_skill_commit"] == skill_commit, context
+assert context["external_sources"] == {"archdoc": skill_commit}, context
+assert run["repository_profile"] == "repository_workspace-fixture", run
+assert run["repository_workspace"]["target_commit"] == target_commit, run
+assert run["repository_workspace"]["external_source_commits"] == {"archdoc": skill_commit}, run
+raw = pathlib.Path(sys.argv[1]).read_text()
+assert "github_token" not in raw
+assert "x-access-token" not in raw
+PY
+
+[[ -d "$SAFEPLANE_HOME/workspaces/$run_id/repo/.git" ]]
+[[ -f "$SAFEPLANE_HOME/workspaces/$run_id/repos/skills/ai-craftkit/skills/archdoc/SKILL.md" ]]
+[[ "$(workspace_git "$SAFEPLANE_HOME/workspaces/$run_id/repo" rev-parse HEAD)" == "$target_commit" ]]
+[[ "$(workspace_git "$SAFEPLANE_HOME/workspaces/$run_id/repos/skills/ai-craftkit" rev-parse HEAD)" == "$skill_commit" ]]
+
+remote_url="$(workspace_git "$SAFEPLANE_HOME/workspaces/$run_id/repo" remote get-url origin)"
+[[ "$remote_url" == "file:///data/safeplane/git-fixtures/target.git" ]]
+[[ "$remote_url" != *"token"* ]]
+
+echo "First run: $run_id target=$target_commit archdoc=$skill_commit"
+
+second_response="$(run_profile)"
+second_run_id="$(python3 - "$second_response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+print(response["run_id"])
+PY
+)"
+[[ "$run_id" != "$second_run_id" ]]
+[[ -d "$SAFEPLANE_HOME/workspaces/$second_run_id/repo/.git" ]]
+[[ "$SAFEPLANE_HOME/workspaces/$run_id/repo" != "$SAFEPLANE_HOME/workspaces/$second_run_id/repo" ]]
+
+echo "Second isolated run: $second_run_id"
+
+response_file="$(mktemp)"
+http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PORT}/connector/develop" \
+  -H 'Content-Type: application/json' \
+  -d '{"connector":"cli","repository_profile":"unknown-profile","message":"This must fail"}')"
+[[ "$http_status" == "500" ]]
+grep -q 'unknown repository profile' "$response_file"
+rm -f "$response_file"
+
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/target.git" rev-parse HEAD)" == "$target_commit" ]]
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/skills.git" rev-parse HEAD)" == "$skill_commit" ]]
+
+echo "Repository profile validation rejected unknown profile"
+echo "Source fixture remotes remained unchanged"
+echo "OK: repository workspace preparation external repository preparation passed"

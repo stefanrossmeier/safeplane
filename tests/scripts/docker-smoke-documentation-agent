@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-fake"
+PROJECT="${SAFEPLANE_EXTERNAL_DOCUMENTATION_PROJECT:-safeplane-external-documentation-smoke}"
+PORT="${SAFEPLANE_EXTERNAL_DOCUMENTATION_PORT:-8799}"
+if [[ -n "${SAFEPLANE_EXTERNAL_DOCUMENTATION_HOME:-}" ]]; then
+  HOME_DIR="$SAFEPLANE_EXTERNAL_DOCUMENTATION_HOME"
+  HOME_CREATED=no
+else
+  HOME_DIR="$(mktemp -d)"
+  HOME_CREATED=yes
+fi
+KEEP="${SAFEPLANE_EXTERNAL_DOCUMENTATION_KEEP:-no}"
+
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export SAFEPLANE_HOME="$HOME_DIR"
+export SAFEPLANE_HARNESS_PORT="$PORT"
+export SAFEPLANE_DEV_SOURCE="$ROOT/tests/fixtures/developer-repo"
+export SAFEPLANE_REPOSITORY_CONFIG="/data/safeplane/config/repositories.yaml"
+export SAFEPLANE_ALLOW_LOCAL_GIT_FIXTURES=yes
+
+mkdir -p "$SAFEPLANE_HOME/workspaces" "$SAFEPLANE_HOME/config" "$SAFEPLANE_HOME/git-fixtures"
+chmod 0755 "$SAFEPLANE_HOME/workspaces"
+
+cleanup() {
+  if [[ "$KEEP" != "yes" ]]; then
+    cleanup_image="$("$COMPOSE" images -q harness 2>/dev/null | head -n 1 || true)"
+    "$COMPOSE" down --remove-orphans --volumes >/dev/null 2>&1 || true
+    if [[ "$HOME_CREATED" == "yes" ]]; then
+      "$ROOT/tests/scripts/remove-container-owned-tree" "$HOME_DIR" "$cleanup_image"
+    fi
+  else
+    echo "Keeping external documentation workflow smoke runtime: project=$PROJECT SAFEPLANE_HOME=$HOME_DIR"
+  fi
+}
+trap cleanup EXIT
+
+create_target_repo() {
+  local name="$1"
+  local with_docs="$2"
+  local work="$SAFEPLANE_HOME/git-fixtures/${name}-work"
+  local bare="$SAFEPLANE_HOME/git-fixtures/${name}.git"
+  rm -rf "$work" "$bare"
+  mkdir -p "$work/src" "$work/checks"
+  git -C "$work" init -q -b main
+  git -C "$work" config user.name "Safeplane fixture"
+  git -C "$work" config user.email "fixture@example.invalid"
+  printf '%s\n' "# external documentation workflow ${name} fixture" > "$work/README.md"
+  cat > "$work/src/greeter.py" <<'PY'
+def greet(name: str) -> str:
+    return f"Hello, {name}!"
+PY
+  cat > "$work/checks/check_greeting.py" <<'PY'
+from pathlib import Path
+content = Path("src/greeter.py").read_text(encoding="utf-8")
+assert "Hello from the developer pipeline" in content, content
+print("controlled greeting check passed")
+PY
+  if [[ "$name" == "target-create" ]]; then
+    for index in $(seq -w 0 44); do
+      printf 'VALUE = %s\n' "$index" > "$work/src/module_${index}.py"
+    done
+    python3 - "$work/src/large.py" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text(
+    "\n".join(f"line-{index:04d}" for index in range(1, 2506)) + "\n",
+    encoding="utf-8",
+)
+PY
+    mkdir -p "$work/scripts"
+    cat > "$work/scripts/release" <<'EOF'
+#!/usr/bin/env python3
+print("release")
+EOF
+  fi
+  if [[ "$with_docs" == "yes" ]]; then
+    mkdir -p "$work/docs"
+    for file in REPO_MAP ARCHITECTURE API_SURFACE OPERATIONS; do
+      cat > "$work/docs/${file}.md" <<EOF
+# Existing ${file}
+
+> Manual note: preserve this operator-authored statement.
+
+Last Reviewed Scope: full review
+Doc Status: MAINTAINED
+Last Documentation Update: 2026-07-18T00:00:00Z
+Updated By: human
+Source Basis: repository fixture evidence
+
+Accurate existing documentation for the preservation fixture.
+EOF
+    done
+  fi
+  git -C "$work" add .
+  git -C "$work" commit -qm "fixture"
+  git clone -q --bare "$work" "$bare"
+  git -C "$work" rev-parse HEAD
+}
+
+create_skill_repo() {
+  local work="$SAFEPLANE_HOME/git-fixtures/skills-work"
+  local bare="$SAFEPLANE_HOME/git-fixtures/skills.git"
+  rm -rf "$work" "$bare"
+  mkdir -p "$work/skills/archdoc/templates"
+  git -C "$work" init -q -b main
+  git -C "$work" config user.name "Safeplane fixture"
+  git -C "$work" config user.email "fixture@example.invalid"
+  cat > "$work/skills/archdoc/SKILL.md" <<'EOF'
+# External archdoc fixture v1
+
+Create evidence-based repository documentation. Preserve accurate manual notes.
+Use the exact external source commit in each generated document.
+EOF
+  printf '%s\n' '# Repository map template v1' > "$work/skills/archdoc/templates/REPO_MAP.template.md"
+  git -C "$work" add .
+  git -C "$work" commit -qm "archdoc fixture v1"
+  git clone -q --bare "$work" "$bare"
+  git -C "$work" remote add fixture "$bare"
+  git -C "$work" rev-parse HEAD
+}
+
+update_skill_repo() {
+  local work="$SAFEPLANE_HOME/git-fixtures/skills-work"
+  printf '%s\n' '' 'Skill revision marker: v2 evidence policy.' >> "$work/skills/archdoc/SKILL.md"
+  printf '%s\n' '# Repository map template v2' > "$work/skills/archdoc/templates/REPO_MAP.template.md"
+  git -C "$work" add .
+  git -C "$work" commit -qm "archdoc fixture v2"
+  git -C "$work" push -q fixture main
+  git -C "$work" rev-parse HEAD
+}
+
+create_commit="$(create_target_repo target-create no)"
+preserve_commit="$(create_target_repo target-preserve yes)"
+skill_commit_v1="$(create_skill_repo)"
+export SAFEPLANE_ARCHDOC_REPOSITORY_URL="file:///data/safeplane/git-fixtures/skills.git"
+
+cat > "$SAFEPLANE_HOME/config/repositories.yaml" <<'YAML'
+version: 1
+credential_profiles: {}
+repository_profiles:
+  external_documentation-create:
+    enabled: true
+    repository_url: file:///data/safeplane/git-fixtures/target-create.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: null
+    allow_file_url: true
+    remote_write_allowed: false
+    branch_prefix: safeplane/
+  external_documentation-preserve:
+    enabled: true
+    repository_url: file:///data/safeplane/git-fixtures/target-preserve.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: null
+    allow_file_url: true
+    remote_write_allowed: false
+    branch_prefix: safeplane/
+YAML
+
+wait_health() {
+  local url="$1"
+  local deadline=$((SECONDS + 120))
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for $url" >&2
+      "$COMPOSE" ps >&2 || true
+      "$COMPOSE" logs harness dev-workspace-mcp dev-workspace-apply-mcp >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+start_run() {
+  local profile="$1"
+  local message="$2"
+  local payload response response_file http_status
+  payload="$(python3 - "$profile" "$message" <<'PY'
+import json, sys
+print(json.dumps({
+    "connector": "cli",
+    "repository_profile": sys.argv[1],
+    "message": sys.argv[2],
+}))
+PY
+)"
+  response_file="$(mktemp)"
+  if ! http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:${PORT}/connector/develop" \
+    -H 'Content-Type: application/json' \
+    -d "$payload")"; then
+    echo "Developer run request failed before an HTTP response was received" >&2
+    cat "$response_file" >&2 || true
+    rm -f "$response_file"
+    return 1
+  fi
+  response="$(cat "$response_file")"
+  rm -f "$response_file"
+  if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+    echo "Developer run returned HTTP $http_status" >&2
+    printf '%s\n' "$response" >&2
+    return 1
+  fi
+  python3 - "$response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+print(response["run_id"])
+PY
+}
+
+echo "Starting isolated external documentation workflow documentation-agent stack..."
+"$COMPOSE" up -d --build \
+  model-gateway calendar-task-mcp notification-task-mcp scheduler \
+  dev-workspace-mcp dev-workspace-apply-mcp dev-check-mcp harness
+wait_health "http://127.0.0.1:${PORT}/health"
+
+run_create_v1="$(start_run external_documentation-create 'Prepare the external documentation workflow documentation fixture')"
+
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_create_v1" "$create_commit" "$skill_commit_v1" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+home = pathlib.Path(sys.argv[1])
+run_id, target_commit, skill_commit = sys.argv[2:]
+run_root = home / "workspaces" / run_id
+pipeline = json.loads((run_root / "pipeline" / "pipeline.json").read_text())
+baseline = json.loads((run_root / "pipeline" / "baseline_documentation.json").read_text())
+final = json.loads((run_root / "pipeline" / "final_documentation.json").read_text())
+evidence = json.loads((run_root / "pipeline" / "baseline_documentation-evidence.json").read_text())
+context = json.loads((run_root / "pipeline" / "repository-context.json").read_text())
+
+assert pipeline["current_state"] == "waiting_for_remote_approval", pipeline
+assert context["base_commit"] == target_commit, context
+assert context["external_skill_commit"] == skill_commit, context
+assert baseline["changed"] is True, baseline
+assert baseline["skill_source_commit"] == skill_commit, baseline
+assert final["changed"] is False, final
+assert final["skill_source_commit"] == skill_commit, final
+assert baseline["skill_files_read"][0] == "SKILL.md", baseline
+assert baseline["patch_proposal_id"].startswith("patch_proposal_"), baseline
+assert baseline["apply_evidence_ref"], baseline
+assert len(baseline["documents"]) == 4, baseline
+assert len(final["documents"]) == 4, final
+assert evidence["repository_complete"] is True, evidence
+repository_evidence = {item["path"]: item for item in evidence["repository_files"]}
+assert len(evidence["repository_tracked_paths"]) >= 49, evidence
+assert "src/module_44.py" in repository_evidence, repository_evidence
+assert "scripts/release" in repository_evidence, repository_evidence
+assert repository_evidence["src/large.py"]["chunk_count"] == 2, repository_evidence["src/large.py"]
+assert repository_evidence["src/large.py"]["truncated"] is False, repository_evidence["src/large.py"]
+
+repo = run_root / "repo"
+for name in ("REPO_MAP.md", "ARCHITECTURE.md", "API_SURFACE.md", "OPERATIONS.md"):
+    content = (repo / "docs" / name).read_text()
+    assert skill_commit in content, (name, content)
+    assert "Generated with `ai-craftkit` skill: `archdoc`" in content, name
+    assert "[Describe" not in content, name
+    assert "github_pat_" not in content, name
+
+analysis_messages = json.loads(
+    (home / "traces" / json.loads((home / "runs" / f"{run_id}.json").read_text())["session_id"] / "turn_001" / "messages.developer.analysis.json").read_text()
+)
+analysis_payload = analysis_messages["messages"][1]["content"]
+assert "docs/ARCHITECTURE.md" in analysis_payload
+assert skill_commit in analysis_payload
+
+doc_messages = json.loads(
+    (home / "traces" / json.loads((home / "runs" / f"{run_id}.json").read_text())["session_id"] / "turn_001" / "messages.developer.baseline_documentation.json").read_text()
+)
+doc_payload = doc_messages["messages"][1]["content"]
+assert "External archdoc fixture v1" not in doc_payload
+assert "external skill content supplied at runtime; not persisted" in doc_payload
+
+digest = hashlib.sha256((repo / "docs" / "REPO_MAP.md").read_bytes()).hexdigest()
+print(digest)
+PY
+create_doc_hash_v1="$("$COMPOSE" exec -T harness python3 - "/data/safeplane/workspaces/$run_create_v1/repo/docs/REPO_MAP.md" <<'PY'
+import hashlib, pathlib, sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+
+echo "Baseline documentation created: run=$run_create_v1 archdoc=$skill_commit_v1"
+
+preserve_tree_before="$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/target-preserve.git" rev-parse HEAD^{tree})"
+run_preserve="$(start_run external_documentation-preserve 'Preserve accurate existing documentation')"
+
+"$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_preserve" "$preserve_commit" "$skill_commit_v1" <<'PY'
+import json
+import pathlib
+import sys
+
+home = pathlib.Path(sys.argv[1])
+run_id, target_commit, skill_commit = sys.argv[2:]
+run_root = home / "workspaces" / run_id
+baseline = json.loads((run_root / "pipeline" / "baseline_documentation.json").read_text())
+final = json.loads((run_root / "pipeline" / "final_documentation.json").read_text())
+context = json.loads((run_root / "pipeline" / "repository-context.json").read_text())
+assert context["base_commit"] == target_commit, context
+assert baseline["changed"] is False, baseline
+assert final["changed"] is False, final
+assert baseline["skill_source_commit"] == skill_commit, baseline
+assert final["skill_source_commit"] == skill_commit, final
+for name in ("REPO_MAP.md", "ARCHITECTURE.md", "API_SURFACE.md", "OPERATIONS.md"):
+    content = (run_root / "repo" / "docs" / name).read_text()
+    assert "Manual note: preserve this operator-authored statement." in content, name
+PY
+preserve_tree_after="$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/target-preserve.git" rev-parse HEAD^{tree})"
+[[ "$preserve_tree_before" == "$preserve_tree_after" ]]
+echo "Accurate existing documentation preserved: run=$run_preserve"
+
+skill_commit_v2="$(update_skill_repo)"
+[[ "$skill_commit_v2" != "$skill_commit_v1" ]]
+run_create_v2="$(start_run external_documentation-create 'Prepare documentation with the newer external skill commit')"
+
+create_doc_hash_v2="$("$COMPOSE" exec -T harness python3 - "/data/safeplane" "$run_create_v2" "$skill_commit_v2" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+home = pathlib.Path(sys.argv[1])
+run_id, skill_commit = sys.argv[2:]
+run_root = home / "workspaces" / run_id
+baseline = json.loads((run_root / "pipeline" / "baseline_documentation.json").read_text())
+final = json.loads((run_root / "pipeline" / "final_documentation.json").read_text())
+assert baseline["skill_source_commit"] == skill_commit, baseline
+assert final["skill_source_commit"] == skill_commit, final
+content = (run_root / "repo" / "docs" / "REPO_MAP.md").read_text()
+assert skill_commit in content
+print(hashlib.sha256(content.encode()).hexdigest())
+PY
+)"
+[[ "$create_doc_hash_v2" != "$create_doc_hash_v1" ]]
+echo "Later run followed updated external skill: run=$run_create_v2 archdoc=$skill_commit_v2"
+
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/target-create.git" rev-parse HEAD)" == "$create_commit" ]]
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/target-preserve.git" rev-parse HEAD)" == "$preserve_commit" ]]
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/skills.git" rev-parse HEAD)" == "$skill_commit_v2" ]]
+
+echo "Source fixture remotes remained unchanged by Safeplane runs"
+echo "OK: external documentation workflow external archdoc documentation agent passed"

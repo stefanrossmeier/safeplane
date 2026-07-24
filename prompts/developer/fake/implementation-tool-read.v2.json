@@ -1,0 +1,11 @@
+{
+  "type": "tool_call",
+  "server_id": "dev-workspace",
+  "tool_name": "dev_workspace_read",
+  "arguments": {
+    "path": "src/greeter.py",
+    "start_line": 1,
+    "max_lines": 200,
+    "max_bytes": 65536
+  }
+}

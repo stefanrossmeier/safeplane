@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+export SAFEPLANE_HARNESS_URL="${SAFEPLANE_HARNESS_URL:-http://127.0.0.1:8787}"
+export SAFEPLANE_TEST_HOME="${SAFEPLANE_HOME:-$HOME/.safeplane}"
+
+echo "Waiting for harness at ${SAFEPLANE_HARNESS_URL}..."
+python3 - <<'PY'
+import os
+import sys
+import time
+import urllib.request
+
+harness_url = os.environ["SAFEPLANE_HARNESS_URL"].rstrip("/")
+deadline = time.time() + 60
+last_error = None
+
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(harness_url + "/health", timeout=3) as response:
+            print("harness health:", response.status, response.read().decode())
+            raise SystemExit(0)
+    except Exception as exc:
+        last_error = exc
+        time.sleep(2)
+
+print(f"Harness did not become ready at {harness_url}: {last_error}", file=sys.stderr)
+raise SystemExit(1)
+PY
+
+python3 - <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+harness_url = os.environ["SAFEPLANE_HARNESS_URL"].rstrip("/")
+safeplane_home = Path(os.environ["SAFEPLANE_TEST_HOME"]).expanduser()
+
+outbox_path = safeplane_home / "data" / "notifications" / "outbox.jsonl"
+deliveries_path = safeplane_home / "data" / "notifications" / "deliveries.jsonl"
+scheduler_log_path = safeplane_home / "logs" / "scheduler" / "scheduler.jsonl"
+
+
+def post_json(url: str, payload: dict) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            raw = response.read().decode("utf-8")
+            print(f"POST {url} -> {response.status}")
+            print(raw)
+            print()
+            return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8")
+        print(f"POST {url} -> {exc.code}", file=sys.stderr)
+        print(raw, file=sys.stderr)
+        raise
+
+
+def broker_call(tool_name: str, arguments: dict) -> dict:
+    response = post_json(
+        harness_url + "/mcp/tools/call",
+        {
+            "workflow_id": "assistant",
+            "server_id": "notification",
+            "tool_name": tool_name,
+            "arguments": arguments,
+        },
+    )
+    return response["structured_content"]
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return records
+
+
+run_at_local = datetime.now(ZoneInfo("Europe/Berlin")) + timedelta(seconds=20)
+run_at_local_text = run_at_local.replace(microsecond=0).isoformat()
+
+message = "notification storage due delivery smoke " + datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+print("Scheduling due notification:")
+print("run_at_local:", run_at_local_text)
+print("message:", message)
+print()
+
+scheduled = broker_call(
+    "notification_schedule",
+    {
+        "message": message,
+        "schedule": {
+            "schedule_type": "once",
+            "run_at_local": run_at_local_text,
+            "timezone": "Europe/Berlin",
+        },
+        "targets": ["all"],
+        "grace_seconds": 120,
+    },
+)
+
+notification_id = scheduled["notification_id"]
+print("scheduled:", notification_id)
+print("next_run_at_utc:", scheduled["next_run_at_utc"])
+print()
+
+deadline = time.time() + 90
+found_outbox = None
+found_delivery = None
+
+while time.time() < deadline:
+    outbox_records = read_jsonl(outbox_path)
+    delivery_records = read_jsonl(deliveries_path)
+
+    for record in reversed(outbox_records):
+        if record.get("schedule_id") == notification_id and record.get("status") == "sent":
+            found_outbox = record
+            break
+
+    for record in reversed(delivery_records):
+        if record.get("schedule_id") == notification_id and record.get("status") == "sent":
+            found_delivery = record
+            break
+
+    if found_outbox and found_delivery:
+        break
+
+    time.sleep(2)
+
+if not found_outbox or not found_delivery:
+    print("Did not observe sent outbox + delivery records.", file=sys.stderr)
+    print("notification_id:", notification_id, file=sys.stderr)
+    print("outbox_path:", outbox_path, file=sys.stderr)
+    print("deliveries_path:", deliveries_path, file=sys.stderr)
+
+    print("\nRecent outbox:", file=sys.stderr)
+    for record in read_jsonl(outbox_path)[-10:]:
+        print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+    print("\nRecent deliveries:", file=sys.stderr)
+    for record in read_jsonl(deliveries_path)[-10:]:
+        print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+    print("\nRecent scheduler logs:", file=sys.stderr)
+    for record in read_jsonl(scheduler_log_path)[-20:]:
+        print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+    raise SystemExit(1)
+
+print("outbox sent:", found_outbox["id"])
+print("delivery sent:", found_delivery["id"])
+print("connector:", found_delivery.get("connector"))
+print("OK")
+PY
+
+echo
+echo "Recent outbox:"
+tail -10 "$HOME/.safeplane/data/notifications/outbox.jsonl" 2>/dev/null || true
+
+echo
+echo "Recent deliveries:"
+tail -10 "$HOME/.safeplane/data/notifications/deliveries.jsonl" 2>/dev/null || true
+
+echo
+echo "Recent scheduler logs:"
+tail -30 "$HOME/.safeplane/logs/scheduler/scheduler.jsonl" 2>/dev/null || true

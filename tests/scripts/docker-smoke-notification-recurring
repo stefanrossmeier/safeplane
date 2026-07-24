@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+export SAFEPLANE_HARNESS_URL="${SAFEPLANE_HARNESS_URL:-http://127.0.0.1:8787}"
+
+python3 - <<'PY'
+import json
+import os
+import time
+import urllib.request
+from datetime import UTC, datetime
+
+harness_url = os.environ["SAFEPLANE_HARNESS_URL"].rstrip("/")
+
+
+def wait_for_harness() -> None:
+    deadline = time.time() + 60
+    last_error = None
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(harness_url + "/health", timeout=3) as response:
+                print("harness health:", response.status, response.read().decode())
+                return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2)
+
+    raise RuntimeError(f"Harness did not become ready: {last_error}")
+
+
+def post_json(payload: dict) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        harness_url + "/mcp/tools/call",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=20) as response:
+        raw = response.read().decode("utf-8")
+        print(response.status, raw)
+        return json.loads(raw)
+
+
+def broker_call(tool_name: str, arguments: dict) -> dict:
+    response = post_json({
+        "workflow_id": "assistant",
+        "server_id": "notification",
+        "tool_name": tool_name,
+        "arguments": arguments,
+    })
+    return response["structured_content"]
+
+
+wait_for_harness()
+
+marker = "notification scheduling recurring broker smoke " + datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+cases = [
+    {
+        "name": "daily",
+        "message": marker + " daily",
+        "schedule": {
+            "schedule_type": "daily_time",
+            "time_local": "09:00",
+            "timezone": "Europe/Berlin",
+        },
+    },
+    {
+        "name": "weekly",
+        "message": marker + " weekly",
+        "schedule": {
+            "schedule_type": "weekly_time",
+            "day_of_week": "sunday",
+            "time_local": "18:00",
+            "timezone": "Europe/Berlin",
+        },
+    },
+    {
+        "name": "weekdays",
+        "message": marker + " weekdays",
+        "schedule": {
+            "schedule_type": "weekdays_time",
+            "time_local": "08:00",
+            "timezone": "Europe/Berlin",
+        },
+    },
+]
+
+created = []
+
+try:
+    for case in cases:
+        result = broker_call(
+            "notification_schedule",
+            {
+                "message": case["message"],
+                "schedule": case["schedule"],
+                "targets": ["all"],
+            },
+        )
+
+        assert result["status"] == "active"
+        assert result["next_run_at_utc"].endswith("Z")
+        assert result["reload"]["status"] in {"ok", "failed"}
+
+        created.append(result["notification_id"])
+        print(case["name"], result["notification_id"], result["next_run_at_utc"])
+
+    listed = broker_call("notification_list", {"include_cancelled": False})
+    listed_ids = {item["id"] for item in listed["notifications"]}
+
+    for notification_id in created:
+        assert notification_id in listed_ids
+
+    print("listed all recurring smoke notifications")
+
+finally:
+    for notification_id in created:
+        result = broker_call(
+            "notification_cancel",
+            {
+                "notification_id": notification_id,
+            },
+        )
+        assert result["status"] == "cancelled"
+        print("cancelled", notification_id)
+
+print("OK")
+PY

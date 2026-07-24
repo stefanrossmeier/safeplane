@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+export PYTHONPATH="services/harness/src:mcp-servers/calendar-task/src:mcp-servers/notification-task/src:mcp-servers/dev-workspace/src:services/scheduler/src:${PYTHONPATH:-}"
+
+tests/scripts/check-repository-hygiene
+pytest -q \
+  tests/unit/test_repository_hygiene.py \
+  tests/unit/test_case_study.py \
+  tests/unit/test_runtime_mode_scripts.py
+
+echo "OK: repository cleanup, neutral fixtures, and capability-oriented naming passed"

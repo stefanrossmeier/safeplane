@@ -1,0 +1,14 @@
+{
+  "type": "final",
+  "implementation_summary_markdown": "# Implementation Summary\n\nPrepared a one-line fixture greeting change inside the approved plan after reading the repository through MCP.",
+  "replacements": [
+    {
+      "path": "src/greeter.py",
+      "old_text": "    return f\"Hello, {name}!\"",
+      "new_text": "    return f\"Hello from the developer pipeline, {name}!\""
+    }
+  ],
+  "changed_files": [
+    "src/greeter.py"
+  ]
+}

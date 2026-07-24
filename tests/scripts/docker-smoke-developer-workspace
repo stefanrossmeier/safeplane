@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-fake"
+PROJECT="${SAFEPLANE_DEVELOPER_WORKSPACE_PROJECT:-safeplane-developer-workspace-smoke}"
+PORT="${SAFEPLANE_DEVELOPER_WORKSPACE_PORT:-8794}"
+if [[ -n "${SAFEPLANE_DEVELOPER_WORKSPACE_HOME:-}" ]]; then
+  HOME_DIR="$SAFEPLANE_DEVELOPER_WORKSPACE_HOME"
+  HOME_CREATED=no
+else
+  HOME_DIR="$(mktemp -d)"
+  HOME_CREATED=yes
+fi
+KEEP="${SAFEPLANE_DEVELOPER_WORKSPACE_KEEP:-no}"
+
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export SAFEPLANE_HOME="$HOME_DIR"
+export SAFEPLANE_HARNESS_PORT="$PORT"
+export SAFEPLANE_DEV_SOURCE="$ROOT/tests/fixtures/developer-repo"
+
+# Pre-create the exact bind-mount source before Compose creates either service.
+# This avoids parent/child bind-mount visibility races on Docker Desktop.
+mkdir -p "$SAFEPLANE_HOME/workspaces"
+chmod 0755 "$SAFEPLANE_HOME/workspaces"
+
+cleanup() {
+  if [[ "$KEEP" != "yes" ]]; then
+    cleanup_image="$("$COMPOSE" images -q harness 2>/dev/null | head -n 1 || true)"
+    "$COMPOSE" down --remove-orphans --volumes >/dev/null 2>&1 || true
+    if [[ "$HOME_CREATED" == "yes" ]]; then
+      "$ROOT/tests/scripts/remove-container-owned-tree" "$HOME_DIR" "$cleanup_image"
+    fi
+  else
+    echo "Keeping developer workspace smoke runtime: project=$PROJECT SAFEPLANE_HOME=$HOME_DIR"
+  fi
+}
+trap cleanup EXIT
+
+wait_health() {
+  local url="$1"
+  local deadline=$((SECONDS + 90))
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for $url" >&2
+      "$COMPOSE" ps >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+wait_container_health() {
+  local container_id="$1"
+  local deadline=$((SECONDS + 90))
+  until docker exec "$container_id" python -c     'import urllib.request; response = urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2); raise SystemExit(0 if response.status == 200 else 1)'     >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for container health: $container_id" >&2
+      "$COMPOSE" logs dev-workspace-mcp >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+json_post() {
+  local url="$1"
+  local payload="$2"
+  curl -fsS -X POST "$url" -H 'Content-Type: application/json' -d "$payload"
+}
+
+echo "Starting isolated fake-mode developer stack..."
+"$COMPOSE" up -d --build \
+  model-gateway calendar-task-mcp notification-task-mcp scheduler dev-workspace-mcp harness
+
+wait_health "http://127.0.0.1:${PORT}/health"
+
+container_id="$($COMPOSE ps -q dev-workspace-mcp)"
+[[ -n "$container_id" ]] || { echo "dev-workspace-mcp container missing" >&2; exit 1; }
+wait_container_health "$container_id"
+
+uid="$(docker exec "$container_id" id -u)"
+[[ "$uid" != "0" ]] || { echo "dev-workspace-mcp unexpectedly runs as root" >&2; exit 1; }
+
+echo "Developer container user: uid=$uid"
+
+response="$(json_post "http://127.0.0.1:${PORT}/connector/developer" '{"connector":"cli","message":"developer list ."}')"
+
+run_and_session="$(python3 - "$response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+assert "README.md" in (response.get("final_message") or ""), response
+print(f'{response["run_id"]}|{response["session_id"]}')
+PY
+)"
+IFS='|' read -r run_id session_id <<EOF_IDS
+$run_and_session
+EOF_IDS
+
+echo "Developer list run: $run_id"
+
+find_response="$(json_post "http://127.0.0.1:${PORT}/connector/developer" '{"connector":"cli","message":"developer find *.py ."}')"
+python3 - "$find_response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+assert "src/greeter.py" in (response.get("final_message") or ""), response
+PY
+
+grep_response="$(json_post "http://127.0.0.1:${PORT}/connector/developer" '{"connector":"cli","message":"developer grep Hello . *.py"}')"
+python3 - "$grep_response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+message = response.get("final_message") or ""
+assert response["status"] == "completed", response
+assert "src/greeter.py" in message and "Hello" in message, response
+PY
+
+read_response="$(json_post "http://127.0.0.1:${PORT}/connector/developer" '{"connector":"cli","message":"developer read src/greeter.py 1 20"}')"
+python3 - "$read_response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+message = response.get("final_message") or ""
+assert response["status"] == "completed", response
+assert "def greet" in message and "Hello, {name}!" in message, response
+PY
+
+echo "Developer list/find/grep/read tools completed"
+
+workspace="$SAFEPLANE_HOME/workspaces/$run_id/repo"
+[[ -f "$workspace/README.md" ]] || { echo "workspace snapshot missing README.md" >&2; exit 1; }
+[[ ! -e "$workspace/.git" ]] || { echo "workspace snapshot unexpectedly contains .git" >&2; exit 1; }
+
+escape_payload="$(python3 - "$run_id" "$session_id" <<'PY'
+import json, sys
+print(json.dumps({
+    "workflow_id": "developer",
+    "server_id": "dev-workspace",
+    "tool_name": "dev_workspace_read",
+    "arguments": {
+        "path": "../../outside.txt",
+        "start_line": 1,
+        "max_lines": 10,
+        "max_bytes": 1024,
+    },
+    "session_id": sys.argv[2],
+    "turn": 1,
+    "run_id": sys.argv[1],
+    "connector": "developer_workspace-smoke",
+}))
+PY
+)"
+
+escape_file="$(mktemp)"
+escape_status="$(curl -sS -o "$escape_file" -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PORT}/mcp/tools/call" \
+  -H 'Content-Type: application/json' \
+  -d "$escape_payload")"
+[[ "$escape_status" == "502" ]] || {
+  echo "expected path escape to fail with HTTP 502, got $escape_status" >&2
+  cat "$escape_file" >&2
+  exit 1
+}
+grep -q 'path escapes allowed root' "$escape_file" || {
+  echo "path escape failure did not report root enforcement" >&2
+  cat "$escape_file" >&2
+  exit 1
+}
+rm -f "$escape_file"
+echo "Path escape rejected"
+
+patch_payload="$(python3 - "$run_id" "$session_id" <<'PY'
+import json, sys
+patch = """diff --git a/src/greeter.py b/src/greeter.py
+--- a/src/greeter.py
++++ b/src/greeter.py
+@@ -1,2 +1,2 @@
+ def greet(name: str) -> str:
+-    return f\"Hello, {name}!\"
++    return f\"Hello from Safeplane, {name}!\"
+"""
+print(json.dumps({
+    "workflow_id": "developer",
+    "server_id": "dev-workspace",
+    "tool_name": "dev_workspace_propose_patch",
+    "arguments": {
+        "summary": "Change the fixture greeting without applying it",
+        "patch": patch,
+    },
+    "session_id": sys.argv[2],
+    "turn": 1,
+    "run_id": sys.argv[1],
+    "connector": "developer_workspace-smoke",
+}))
+PY
+)"
+
+patch_response="$(json_post "http://127.0.0.1:${PORT}/mcp/tools/call" "$patch_payload")"
+artifact_ref="$(python3 - "$patch_response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+content = response["structured_content"]
+assert content["exit_code"] == 0, response
+assert content["workspace_root"] == "/workspace", response
+assert content["artifact_ref"], response
+assert content["evidence_ref"], response
+print(content["artifact_ref"])
+PY
+)"
+
+artifact="$SAFEPLANE_HOME/$artifact_ref"
+[[ -f "$artifact" ]] || { echo "patch proposal artifact missing: $artifact" >&2; exit 1; }
+grep -q 'Hello from Safeplane' "$artifact"
+
+grep -q 'Hello, {name}' "$workspace/src/greeter.py"
+if grep -q 'Hello from Safeplane' "$workspace/src/greeter.py"; then
+  echo "read-only workspace was modified" >&2
+  exit 1
+fi
+
+evidence="$SAFEPLANE_HOME/workspaces/$run_id/evidence/tool-calls.jsonl"
+[[ -f "$evidence" ]] || { echo "tool evidence missing" >&2; exit 1; }
+grep -q 'dev_workspace_propose_patch' "$evidence"
+grep -q '"exit_code": 0' "$evidence"
+grep -q '"workspace_root": "/workspace"' "$evidence"
+
+echo "Patch proposal artifact: $artifact_ref"
+echo "Tool evidence: workspaces/$run_id/evidence/tool-calls.jsonl"
+echo "OK: developer workspace read-only developer workspace smoke passed"

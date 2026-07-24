@@ -1,0 +1,50 @@
+services:
+  harness:
+    environment:
+      SAFEPLANE_GITHUB_API_URL: http://github-mock:8080
+    volumes:
+      - publication-remotes:/data/safeplane/publication-remotes
+    depends_on:
+      github-mock:
+        condition: service_healthy
+    networks:
+      - harness-egress
+      - harness-model
+      - harness-tools
+      - github-mock-internal
+
+  github-mock:
+    build:
+      context: .
+      dockerfile: tests/fixtures/github-mock/Dockerfile
+    user: "10001:10001"
+    environment:
+      SAFEPLANE_GITHUB_MOCK_STATE: /data/state.json
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/mock-github:/data
+    networks:
+      - github-mock-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 32
+    cpus: "0.25"
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+networks:
+  github-mock-internal:
+    internal: true
+
+volumes:
+  publication-remotes:

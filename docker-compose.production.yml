@@ -1,0 +1,28 @@
+x-production-logging: &production-logging
+  driver: json-file
+  options:
+    max-size: ${SAFEPLANE_LOG_MAX_SIZE:-10m}
+    max-file: ${SAFEPLANE_LOG_MAX_FILES:-5}
+
+services:
+  harness:
+    logging: *production-logging
+  model-gateway:
+    logging: *production-logging
+  calendar-task-mcp:
+    logging: *production-logging
+  notification-task-mcp:
+    logging: *production-logging
+  scheduler:
+    logging: *production-logging
+  telegram-connector:
+    logging: *production-logging
+  dev-workspace-mcp:
+    restart: unless-stopped
+    logging: *production-logging
+  dev-workspace-apply-mcp:
+    restart: unless-stopped
+    logging: *production-logging
+  dev-check-mcp:
+    restart: unless-stopped
+    logging: *production-logging

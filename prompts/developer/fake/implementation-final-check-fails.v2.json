@@ -1,0 +1,14 @@
+{
+  "type": "final",
+  "implementation_summary_markdown": "# Implementation Summary\n\nUpdated the greeting, but this candidate intentionally does not satisfy the declared focused check.",
+  "replacements": [
+    {
+      "path": "src/greeter.py",
+      "old_text": "    return f\"Hello, {name}!\"",
+      "new_text": "    return f\"Hello from a broken candidate, {name}!\""
+    }
+  ],
+  "changed_files": [
+    "src/greeter.py"
+  ]
+}

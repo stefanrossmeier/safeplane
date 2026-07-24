@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-fake"
+PROJECT="${SAFEPLANE_DEVELOPER_CONTRACT_PROJECT:-safeplane-developer-contract-smoke}"
+PORT="${SAFEPLANE_DEVELOPER_CONTRACT_PORT:-8796}"
+if [[ -n "${SAFEPLANE_DEVELOPER_CONTRACT_HOME:-}" ]]; then
+  HOME_DIR="$SAFEPLANE_DEVELOPER_CONTRACT_HOME"
+  HOME_CREATED=no
+else
+  HOME_DIR="$(mktemp -d)"
+  HOME_CREATED=yes
+fi
+KEEP="${SAFEPLANE_DEVELOPER_CONTRACT_KEEP:-no}"
+
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export SAFEPLANE_HOME="$HOME_DIR"
+export SAFEPLANE_HARNESS_PORT="$PORT"
+export SAFEPLANE_DEV_SOURCE="$ROOT/tests/fixtures/developer-repo"
+
+mkdir -p "$SAFEPLANE_HOME/workspaces"
+chmod 0755 "$SAFEPLANE_HOME/workspaces"
+
+cleanup() {
+  if [[ "$KEEP" != "yes" ]]; then
+    cleanup_image="$("$COMPOSE" images -q harness 2>/dev/null | head -n 1 || true)"
+    "$COMPOSE" down --remove-orphans --volumes >/dev/null 2>&1 || true
+    if [[ "$HOME_CREATED" == "yes" ]]; then
+      "$ROOT/tests/scripts/remove-container-owned-tree" "$HOME_DIR" "$cleanup_image"
+    fi
+  else
+    echo "Keeping developer workflow contract smoke runtime: project=$PROJECT SAFEPLANE_HOME=$HOME_DIR"
+  fi
+}
+trap cleanup EXIT
+
+wait_health() {
+  local url="$1"
+  local deadline=$((SECONDS + 90))
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for $url" >&2
+      "$COMPOSE" ps >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+json_post() {
+  local url="$1"
+  local payload="$2"
+  curl -fsS -X POST "$url" -H 'Content-Type: application/json' -d "$payload"
+}
+
+echo "Starting isolated developer workflow contract fake developer pipeline stack..."
+"$COMPOSE" up -d --build \
+  model-gateway calendar-task-mcp notification-task-mcp scheduler \
+  dev-workspace-mcp dev-workspace-apply-mcp harness
+
+wait_health "http://127.0.0.1:${PORT}/health"
+
+echo "Running LGTM pipeline scenario..."
+response="$(json_post "http://127.0.0.1:${PORT}/connector/develop" \
+  '{"connector":"cli","message":"Implement the bounded fixture greeting task"}')"
+run_id="$(python3 - "$response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+assert "waiting_for_remote_approval" in (response.get("final_message") or ""), response
+print(response["run_id"])
+PY
+)"
+
+pipeline="$SAFEPLANE_HOME/workspaces/$run_id/pipeline/pipeline.json"
+[[ -f "$pipeline" ]] || { echo "pipeline state missing: $pipeline" >&2; exit 1; }
+python3 - "$pipeline" <<'PY'
+import json, pathlib, sys
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert state["current_state"] == "waiting_for_remote_approval", state
+assert state["completed_stages"] == [
+    "repositories",
+    "baseline_documentation",
+    "analysis",
+    "planning",
+    "implementation",
+    "checks",
+    "final_documentation",
+    "review",
+    "pr",
+    "remote_approval",
+], state
+assert len(state["agent_runs"]) == 7, state
+assert len({item["model_profile"] for item in state["agent_runs"]}) == 6, state
+assert all(item["prompt_id"] for item in state["agent_runs"]), state
+assert all(item["actual_provider"] == "safeplane-fake" for item in state["agent_runs"]), state
+assert "pr.md" in state["artifacts"], state
+PY
+
+pipeline_dir="$SAFEPLANE_HOME/workspaces/$run_id/pipeline"
+for expected in \
+  request.json repository-context.json requirements.md tasks.md plan.md \
+  check-plan.json implementation.patch checks.json review.md pr.md \
+  stage-events.jsonl; do
+  [[ -f "$pipeline_dir/$expected" ]] || {
+    echo "missing pipeline artifact: $pipeline_dir/$expected" >&2
+    exit 1
+  }
+done
+
+grep -q 'developer_pipeline_stage_completed' \
+  "$SAFEPLANE_HOME/traces"/*/turn_001/agent-runtime.trace.jsonl
+grep -q 'developer_documentation' \
+  "$SAFEPLANE_HOME/traces"/*/turn_001/model-gateway.trace.jsonl
+grep -q 'developer_implementation' \
+  "$SAFEPLANE_HOME/traces"/*/turn_001/model-gateway.trace.jsonl
+
+echo "LGTM run: $run_id"
+
+echo "Running REQUEST_CHANGES stop scenario..."
+changes_response="$(json_post "http://127.0.0.1:${PORT}/connector/develop" \
+  '{"connector":"cli","message":"[safeplane-fake-scenario:review_changes_requested] Implement the bounded fixture greeting task"}')"
+changes_run_id="$(python3 - "$changes_response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+assert "REQUEST_CHANGES" in (response.get("final_message") or ""), response
+print(response["run_id"])
+PY
+)"
+changes_pipeline="$SAFEPLANE_HOME/workspaces/$changes_run_id/pipeline/pipeline.json"
+python3 - "$changes_pipeline" <<'PY'
+import json, pathlib, sys
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert state["current_state"] == "review_changes_requested", state
+assert state["completed_stages"][-1] == "review", state
+assert "pr" not in state["completed_stages"], state
+assert "pr.md" not in state["artifacts"], state
+PY
+[[ ! -e "$SAFEPLANE_HOME/workspaces/$changes_run_id/pipeline/pr.md" ]]
+
+echo "REQUEST_CHANGES run: $changes_run_id"
+
+echo "Verifying the existing ad hoc developer entrypoint still works..."
+ad_hoc="$(json_post "http://127.0.0.1:${PORT}/connector/developer" \
+  '{"connector":"cli","message":"developer list ."}')"
+python3 - "$ad_hoc" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+assert "README.md" in (response.get("final_message") or ""), response
+PY
+
+echo "OK: developer workflow contract developer pipeline contracts and fake stage flow passed"

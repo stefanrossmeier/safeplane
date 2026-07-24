@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+export SAFEPLANE_HARNESS_URL="${SAFEPLANE_HARNESS_URL:-http://127.0.0.1:8787}"
+
+python3 - <<'PY'
+import json
+import os
+import urllib.request
+
+harness_url = os.environ["SAFEPLANE_HARNESS_URL"].rstrip("/")
+
+
+def broker_call(tool_name: str, arguments: dict) -> dict:
+    body = json.dumps({
+        "workflow_id": "assistant",
+        "server_id": "notification",
+        "tool_name": tool_name,
+        "arguments": arguments,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        harness_url + "/mcp/tools/call",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if payload.get("is_error"):
+        raise RuntimeError(payload)
+
+    return payload["structured_content"]
+
+
+active = broker_call("notification_list", {"include_cancelled": False})
+all_records = broker_call("notification_list", {"include_cancelled": True})
+
+print("active notifications:", len(active["notifications"]))
+for item in active["notifications"]:
+    print("-", item["id"], item["status"], item["schedule"]["schedule_type"], item["message"])
+
+print()
+print("all notification records:", len(all_records["notifications"]))
+status_counts = {}
+for item in all_records["notifications"]:
+    status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+
+print("status counts:", status_counts)
+PY

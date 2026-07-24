@@ -1,0 +1,8 @@
+services:
+  harness:
+    secrets:
+      - github_token
+
+secrets:
+  github_token:
+    file: ${SAFEPLANE_GITHUB_TOKEN_FILE:-${SAFEPLANE_SECRET_ROOT:-${HOME}/.config/safeplane/secrets}/github_token}

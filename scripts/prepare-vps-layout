@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import pwd
+from pathlib import Path
+
+RUNTIME_DIRS = (
+    "sessions", "runs", "traces", "workspaces", "data/calendar",
+    "data/notifications", "logs/mcp", "logs/scheduler",
+    "logs/connectors/telegram", "connectors/telegram", "config",
+    "git-fixtures", "evals", "deployment",
+)
+
+
+def resolved_env(name: str) -> Path:
+    value = os.environ.get(name)
+    if not value:
+        raise SystemExit(f"{name} must be set")
+    path = Path(value).expanduser().resolve(strict=False)
+    if not path.is_absolute() or str(path) == "/":
+        raise SystemExit(f"Unsafe {name}: {path}")
+    return path
+
+
+def within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit("Run with sudo so UID-aligned ownership can be enforced.")
+
+    runtime = resolved_env("SAFEPLANE_HOME")
+    secrets = resolved_env("SAFEPLANE_SECRET_ROOT")
+    backup = resolved_env("SAFEPLANE_BACKUP_ROOT")
+    log_root = resolved_env("SAFEPLANE_LOG_ROOT")
+    operator = os.environ.get("SAFEPLANE_OPERATOR_USER") or os.environ.get("SUDO_USER")
+    if not operator:
+        raise SystemExit("SAFEPLANE_OPERATOR_USER must be set")
+    operator_entry = pwd.getpwnam(operator)
+
+    if within(secrets, runtime) or within(runtime, secrets):
+        raise SystemExit("Runtime and secret roots must be separate")
+
+    runtime.mkdir(parents=True, exist_ok=True)
+    os.chown(runtime, operator_entry.pw_uid, operator_entry.pw_gid)
+    runtime.chmod(0o750)
+    for relative in RUNTIME_DIRS:
+        path = runtime / relative
+        path.mkdir(parents=True, exist_ok=True)
+        os.chown(path, 10001, operator_entry.pw_gid)
+        path.chmod(0o2770)
+
+    secrets.mkdir(parents=True, exist_ok=True)
+    os.chown(secrets, operator_entry.pw_uid, operator_entry.pw_gid)
+    secrets.chmod(0o700)
+
+    for path in (backup, log_root):
+        path.mkdir(parents=True, exist_ok=True)
+        os.chown(path, operator_entry.pw_uid, operator_entry.pw_gid)
+        path.chmod(0o750)
+
+    print(f"Runtime root: {runtime}")
+    print(f"Secret root: {secrets}")
+    print(f"Backup root: {backup}")
+    print(f"Log root: {log_root}")
+    print("OK: strict VPS layout prepared")
+
+
+if __name__ == "__main__":
+    main()

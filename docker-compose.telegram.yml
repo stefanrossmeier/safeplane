@@ -1,0 +1,60 @@
+services:
+  harness:
+    networks:
+      - harness-egress
+      - harness-model
+      - harness-tools
+      - connector-harness
+
+  telegram-connector:
+    build: ./connectors/telegram
+    user: "10001:10001"
+    environment:
+      SAFEPLANE_HOME: /data/safeplane
+      SAFEPLANE_HARNESS_URL: http://harness:8080
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+      TELEGRAM_ALLOWED_USER_IDS_FILE: /run/secrets/telegram_allowed_user_ids
+      TELEGRAM_POLL_TIMEOUT_SECONDS: ${TELEGRAM_POLL_TIMEOUT_SECONDS:-30}
+      TELEGRAM_DELETE_WEBHOOK_ON_START: ${TELEGRAM_DELETE_WEBHOOK_ON_START:-true}
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/connectors/telegram:/data/safeplane/connectors/telegram
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/logs/connectors/telegram:/data/safeplane/logs/connectors/telegram
+    secrets:
+      - telegram_bot_token
+      - telegram_allowed_user_ids
+    depends_on:
+      harness:
+        condition: service_healthy
+    networks:
+      - telegram-egress
+      - connector-harness
+      - notification-delivery
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 64
+    cpus: "0.50"
+    mem_limit: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  scheduler:
+    environment:
+      SAFEPLANE_NOTIFICATION_CONNECTORS: log,telegram
+      SAFEPLANE_TELEGRAM_CONNECTOR_URL: http://telegram-connector:8080
+
+secrets:
+  telegram_bot_token:
+    file: ${SAFEPLANE_TELEGRAM_BOT_TOKEN_FILE:-${SAFEPLANE_SECRET_ROOT:-${HOME}/.config/safeplane/secrets}/telegram_bot_token}
+  telegram_allowed_user_ids:
+    file: ${SAFEPLANE_TELEGRAM_ALLOWED_USER_IDS_FILE:-${SAFEPLANE_SECRET_ROOT:-${HOME}/.config/safeplane/secrets}/telegram_allowed_user_ids}

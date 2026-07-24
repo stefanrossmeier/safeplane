@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+export SAFEPLANE_HARNESS_URL="${SAFEPLANE_HARNESS_URL:-http://127.0.0.1:8787}"
+
+python3 - <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+harness_url = os.environ["SAFEPLANE_HARNESS_URL"].rstrip("/")
+
+SMOKE_MARKERS = [
+    "notification storage compose smoke",
+    "notification storage docker smoke notification",
+    "notification storage direct MCP smoke",
+    "notification storage harness broker smoke",
+    "notification storage due delivery smoke",
+    "notification scheduling recurring broker smoke",
+]
+
+
+def wait_for_harness() -> None:
+    deadline = time.time() + 60
+    last_error = None
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(harness_url + "/health", timeout=3) as response:
+                print("harness health:", response.status, response.read().decode())
+                return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2)
+
+    print(f"Harness did not become ready at {harness_url}: {last_error}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def post_json(payload: dict) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+
+    deadline = time.time() + 60
+    last_error = None
+
+    while time.time() < deadline:
+        req = urllib.request.Request(
+            harness_url + "/mcp/tools/call",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8")
+            raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2)
+
+    raise RuntimeError(f"Request did not succeed after retries: {last_error}")
+
+
+def broker_call(tool_name: str, arguments: dict) -> dict:
+    response = post_json({
+        "workflow_id": "assistant",
+        "server_id": "notification",
+        "tool_name": tool_name,
+        "arguments": arguments,
+    })
+
+    if response.get("is_error"):
+        raise RuntimeError(response)
+
+    return response["structured_content"]
+
+
+wait_for_harness()
+
+listed = broker_call("notification_list", {"include_cancelled": False})
+notifications = listed["notifications"]
+
+cancelled = []
+
+for notification in notifications:
+    message = notification.get("message", "")
+    notification_id = notification["id"]
+
+    if any(marker in message for marker in SMOKE_MARKERS):
+        result = broker_call(
+            "notification_cancel",
+            {
+                "notification_id": notification_id,
+            },
+        )
+        cancelled.append(result["notification_id"])
+
+print("cancelled smoke notifications:", len(cancelled))
+for notification_id in cancelled:
+    print("-", notification_id)
+PY

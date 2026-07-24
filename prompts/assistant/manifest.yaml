@@ -1,0 +1,7 @@
+prompt_id: assistant.system
+current_version: v1
+
+versions:
+  v1:
+    file: system.v1.md
+    description: Initial Safeplane assistant workflow assistant prompt

@@ -1,0 +1,200 @@
+safeplane:
+  name: local-safeplane
+  home_env: SAFEPLANE_HOME
+  default_home: ~/.safeplane
+connectors:
+  telegram:
+    enabled: true
+    default_entrypoint: assistant
+entrypoints:
+  chat:
+    connector: cli
+    workflow: chat
+    operator_facing: true
+    connectors:
+      cli:
+        exposed: true
+        command: chat
+        usage: safeplane chat <message>
+        start_mode: wait
+        session_continuation: true
+        arguments:
+        - name: message
+          required: true
+          consume_rest: true
+      telegram:
+        exposed: true
+        command: chat
+        usage: /chat <message>
+        run_usage: /run chat <message>
+        start_mode: wait
+        session_continuation: true
+        arguments:
+        - name: message
+          required: true
+          consume_rest: true
+  assistant:
+    connector: cli
+    workflow: assistant
+    operator_facing: true
+    connectors:
+      cli:
+        exposed: true
+        command: assistant
+        usage: safeplane assistant <message>
+        start_mode: wait
+        session_continuation: true
+        arguments:
+        - name: message
+          required: true
+          consume_rest: true
+      telegram:
+        exposed: true
+        command: assistant
+        usage: /assistant <message>
+        run_usage: /run assistant <message>
+        start_mode: wait
+        session_continuation: true
+        arguments:
+        - name: message
+          required: true
+          consume_rest: true
+  slow:
+    connector: cli
+    workflow: slow
+    operator_facing: false
+    connectors:
+      cli:
+        exposed: true
+        command: slow
+        usage: safeplane slow <seconds>
+        start_mode: wait
+        session_continuation: true
+        arguments:
+        - name: message
+          required: true
+          consume_rest: true
+      telegram:
+        exposed: false
+  developer:
+    connector: cli
+    workflow: developer
+    operator_facing: false
+    connectors:
+      cli:
+        exposed: true
+        command: developer
+        usage: safeplane developer <message>
+        start_mode: wait
+        session_continuation: true
+        arguments:
+        - name: message
+          required: true
+          consume_rest: true
+      telegram:
+        exposed: false
+  develop:
+    connector: cli
+    workflow: developer
+    operator_facing: true
+    connectors:
+      cli:
+        exposed: true
+        command: develop
+        usage: safeplane develop --repo <repository-profile> <task>
+        start_mode: async
+        session_continuation: false
+        arguments:
+        - name: repository_profile
+          flag: --repo
+          required: true
+        - name: message
+          required: true
+          consume_rest: true
+      telegram:
+        exposed: true
+        command: develop
+        usage: /develop <repository-profile> <task>
+        run_usage: /run develop --repo <repository-profile> <task>
+        start_mode: async
+        session_continuation: false
+        arguments:
+        - name: repository_profile
+          flag: --repo
+          required: true
+        - name: message
+          required: true
+          consume_rest: true
+workflows:
+  chat:
+    enabled: true
+    contract: workflows/chat/workflow.yaml
+    service: harness
+    endpoint: internal://harness/agent-runtime
+    runtime: harness_agent
+  assistant:
+    enabled: true
+    contract: workflows/assistant/workflow.yaml
+    service: harness
+    endpoint: internal://harness/agent-runtime
+    runtime: harness_agent
+  slow:
+    enabled: true
+    contract: workflows/slow/workflow.yaml
+    service: harness
+    endpoint: internal://harness/agent-runtime
+    runtime: harness_agent
+  developer:
+    enabled: true
+    contract: workflows/developer/workflow.yaml
+    service: harness
+    endpoint: internal://harness/agent-runtime
+    runtime: harness_agent
+model_gateway:
+  service: model-gateway
+  endpoint: http://model-gateway:8080/chat
+trace:
+  format: jsonl
+  full_messages: artifact
+mcp_servers:
+  calendar:
+    enabled: true
+    transport: internal_http_jsonrpc
+    endpoint: http://calendar-task-mcp:8080/mcp
+    safeplane_enforcement:
+      type: service_data_boundary
+      description: Calendar MCP service may only use SAFEPLANE_HOME/data/calendar
+        through calendar_store.py
+  notification:
+    endpoint: http://notification-task-mcp:8080/mcp
+    enabled: true
+    transport: internal_http_jsonrpc
+    safeplane_enforcement:
+      type: service_data_boundary
+      description: Notification MCP service may only use SAFEPLANE_HOME/data/notifications
+        through notification_store.py
+  dev-workspace:
+    enabled: true
+    transport: internal_http_jsonrpc
+    endpoint: http://dev-workspace-mcp:8080/mcp
+    safeplane_enforcement:
+      type: per_run_read_only_workspace
+      description: Harness snapshots the declared repository into SAFEPLANE_HOME/workspaces/<run_id>/repo;
+        the non-root MCP container sees only /workspace read-only and enforces the
+        run-specific root.
+
+  dev-check:
+    enabled: true
+    transport: internal_http_jsonrpc
+    endpoint: unix:///run/safeplane-dev-check/dev-check.sock
+    safeplane_enforcement:
+      type: declared_command_profile_isolated_execution
+      description: Declared checks run without a shell in a tmpfs copy of the target repository; the runner has network_mode none, receives no secrets, uses a Unix-socket control channel, and has explicit CPU, memory, process, timeout, and output limits.
+
+  dev-workspace-apply:
+    enabled: true
+    transport: internal_http_jsonrpc
+    endpoint: http://dev-workspace-apply-mcp:8080/mcp
+    safeplane_enforcement:
+      type: explicit_approval_writable_workspace
+      description: The harness creates a one-time writable staging copy only after explicit user approval; the approval-only MCP service applies the validated patch there and cannot access host source or secrets.

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+WRITABLE_RUNTIME_DIRS = (
+    "sessions",
+    "runs",
+    "traces",
+    "workspaces",
+    "data/calendar",
+    "data/notifications",
+    "logs/mcp",
+    "logs/scheduler",
+    "logs/connectors/telegram",
+    "connectors/telegram",
+    "mock-github",
+    "git-fixtures",
+    "evals",
+)
+READ_ONLY_RUNTIME_DIRS = ("config",)
+
+
+def resolved(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+def is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def main() -> None:
+    runtime_root = resolved(
+        Path(os.environ.get("SAFEPLANE_HOME", str(Path.home() / ".safeplane")))
+    )
+    secret_root = resolved(
+        Path(
+            os.environ.get(
+                "SAFEPLANE_SECRET_ROOT",
+                str(Path.home() / ".config" / "safeplane" / "secrets"),
+            )
+        )
+    )
+
+    if is_within(secret_root, runtime_root):
+        raise SystemExit(
+            "SAFEPLANE_SECRET_ROOT must be outside SAFEPLANE_HOME so runtime mounts cannot expose secrets."
+        )
+
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.chmod(0o700)
+
+    for relative in WRITABLE_RUNTIME_DIRS:
+        path = runtime_root / relative
+        path.mkdir(parents=True, exist_ok=True)
+        # The runtime root itself is private. World-writable leaf directories let
+        # the fixed non-root container UID write bind-mounted state on Linux.
+        path.chmod(0o777)
+
+    for relative in READ_ONLY_RUNTIME_DIRS:
+        path = runtime_root / relative
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o755)
+
+    secret_root.mkdir(parents=True, exist_ok=True)
+    secret_root.chmod(0o700)
+
+    legacy_secret_root = runtime_root / "secrets"
+    print(f"Runtime root: {runtime_root}")
+    print(f"Secret root: {secret_root}")
+    if legacy_secret_root.exists():
+        legacy_files = sorted(path.name for path in legacy_secret_root.iterdir() if path.is_file())
+        if legacy_files:
+            print("WARNING: legacy secrets remain below SAFEPLANE_HOME and are no longer mounted:")
+            for name in legacy_files:
+                print(f"- {legacy_secret_root / name}")
+            print("Recreate or move them into SAFEPLANE_SECRET_ROOT, then remove the legacy copies.")
+    print("OK: Safeplane runtime and secret roots are separated")
+
+
+if __name__ == "__main__":
+    main()

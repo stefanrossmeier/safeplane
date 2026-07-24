@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+operator_env="${SAFEPLANE_OPERATOR_ENV:-/etc/safeplane/operator.env}"
+if [[ -f "$operator_env" ]]; then
+  while IFS='=' read -r name value; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "ERROR: invalid operator environment name in $operator_env: $name" >&2
+      exit 2
+    fi
+    if [[ -z "${!name+x}" ]]; then
+      export "$name=$value"
+    fi
+  done < "$operator_env"
+fi
+
+files=(
+  -f docker-compose.yml
+  -f docker-compose.real.yml
+  -f docker-compose.telegram.yml
+  -f docker-compose.production.yml
+)
+
+case "${SAFEPLANE_VPS_PROFILE:-assistant}" in
+  assistant)
+    ;;
+  developer)
+    files+=(
+      -f docker-compose.developer.yml
+      -f docker-compose.github.yml
+    )
+    ;;
+  *)
+    echo "ERROR: SAFEPLANE_VPS_PROFILE must be assistant or developer" >&2
+    exit 2
+    ;;
+esac
+
+exec docker compose "${files[@]}" "$@"

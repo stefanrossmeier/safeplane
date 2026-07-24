@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+if [[ "${SAFEPLANE_CONFIRM_REAL_TELEGRAM_SMOKE:-}" != "yes" ]]; then
+  cat >&2 <<'MESSAGE'
+This is a manual real-mode smoke test.
+
+It calls OpenRouter through model-gateway and sends a real Telegram reminder to
+configured Telegram recipients. It is intentionally excluded from normal CI.
+
+Run it explicitly with:
+
+  SAFEPLANE_CONFIRM_REAL_TELEGRAM_SMOKE=yes \
+    tests/scripts/validate-real-assistant-telegram-reminder
+MESSAGE
+  exit 2
+fi
+
+delay_minutes="${SAFEPLANE_REAL_REMINDER_DELAY_MINUTES:-5}"
+
+if ! [[ "$delay_minutes" =~ ^[0-9]+$ ]] || (( delay_minutes < 2 || delay_minutes > 15 )); then
+  echo "SAFEPLANE_REAL_REMINDER_DELAY_MINUTES must be an integer from 2 to 15" >&2
+  exit 2
+fi
+
+echo "Checking the current Safeplane runtime..."
+tests/scripts/status-safeplane-mode
+
+scheduler_connectors="$(tests/scripts/compose-safeplane-telegram-real exec -T scheduler sh -lc 'printf "%s" "${SAFEPLANE_NOTIFICATION_CONNECTORS:-log}"' 2>/dev/null)"
+case ",$scheduler_connectors," in
+  *,telegram,*) ;;
+  *)
+    echo >&2
+    echo "The scheduler is not configured for Telegram delivery." >&2
+    echo "Current SAFEPLANE_NOTIFICATION_CONNECTORS: $scheduler_connectors" >&2
+    echo >&2
+    echo "Recreate the complete Telegram real-mode stack first:" >&2
+    echo "  tests/scripts/compose-safeplane-telegram-real up -d --build --force-recreate \\" >&2
+    echo "    model-gateway calendar-task-mcp notification-task-mcp harness scheduler telegram-connector" >&2
+    exit 2
+    ;;
+esac
+
+echo
+echo "Running real assistant -> notification_schedule -> Telegram smoke..."
+
+tests/scripts/compose-safeplane-telegram-real exec -T \
+  -e SAFEPLANE_REAL_REMINDER_DELAY_MINUTES="$delay_minutes" \
+  telegram-connector python -u - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.request
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from telegram_connector.main import HarnessClient
+
+SAFEPLANE_HOME = Path(os.environ.get("SAFEPLANE_HOME", "/data/safeplane"))
+DELAY_MINUTES = int(os.environ["SAFEPLANE_REAL_REMINDER_DELAY_MINUTES"])
+BERLIN = ZoneInfo("Europe/Berlin")
+
+SCHEDULES_PATH = SAFEPLANE_HOME / "data/notifications/schedules.jsonl"
+OUTBOX_PATH = SAFEPLANE_HOME / "data/notifications/outbox.jsonl"
+DELIVERIES_PATH = SAFEPLANE_HOME / "data/notifications/deliveries.jsonl"
+SCHEDULER_LOG_PATH = SAFEPLANE_HOME / "logs/scheduler/scheduler.jsonl"
+TELEGRAM_LOG_PATH = (
+    SAFEPLANE_HOME / "logs/connectors/telegram/outbound-notifications.jsonl"
+)
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+
+    records: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return records
+
+
+def wait_for_url(url: str, label: str) -> None:
+    deadline = time.time() + 60
+    last_error: Exception | None = None
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status == 200:
+                    print(f"{label}: ok")
+                    return
+        except Exception as exc:  # pragma: no cover - manual smoke diagnostics
+            last_error = exc
+        time.sleep(2)
+
+    raise RuntimeError(f"{label} not ready: {last_error}")
+
+
+def parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def latest_schedule_records() -> dict[str, dict]:
+    latest: dict[str, dict] = {}
+    for record in read_jsonl(SCHEDULES_PATH):
+        notification_id = str(record.get("id") or "")
+        if notification_id:
+            latest[notification_id] = record
+    return latest
+
+
+def matching_new_schedules(
+    *,
+    existing_ids: set[str],
+    target_utc: datetime,
+) -> list[dict]:
+    matches: list[dict] = []
+
+    for notification_id, record in latest_schedule_records().items():
+        if notification_id in existing_ids:
+            continue
+        if record.get("status") != "active":
+            continue
+        if record.get("schedule", {}).get("schedule_type") != "once":
+            continue
+        if "telegram" not in record.get("targets", []):
+            continue
+
+        next_run_raw = str(record.get("next_run_at_utc") or "")
+        if not next_run_raw:
+            continue
+
+        if abs((parse_utc(next_run_raw) - target_utc).total_seconds()) > 60:
+            continue
+
+        matches.append(record)
+
+    return matches
+
+
+def run_trace_events(session_id: str, turn: int) -> list[dict]:
+    path = (
+        SAFEPLANE_HOME
+        / "traces"
+        / session_id
+        / f"turn_{turn:03d}"
+        / "agent-runtime.trace.jsonl"
+    )
+    return read_jsonl(path)
+
+
+def show_recent(label: str, path: Path, count: int = 30) -> None:
+    print(f"\n=== {label}: {path} ===", file=sys.stderr)
+    for record in read_jsonl(path)[-count:]:
+        print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+
+wait_for_url("http://harness:8080/health", "harness")
+wait_for_url("http://telegram-connector:8080/health", "telegram connector")
+wait_for_url("http://scheduler:8080/health", "scheduler")
+
+now_local = datetime.now(UTC).astimezone(BERLIN)
+target_local = (now_local + timedelta(minutes=DELAY_MINUTES)).replace(
+    second=0,
+    microsecond=0,
+)
+
+# If rounding moved the target too close, move it one additional minute ahead.
+if target_local <= now_local + timedelta(minutes=1):
+    target_local += timedelta(minutes=1)
+
+marker = (
+    "Safeplane RUNTIME_MODE real assistant reminder smoke "
+    + datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+)
+existing_schedule_ids = set(latest_schedule_records())
+target_utc = target_local.astimezone(UTC)
+prompt = f"Remind me today at {target_local:%H:%M}: {marker}"
+
+print("assistant request:", prompt)
+print("target local:", target_local.isoformat())
+
+harness = HarnessClient("http://harness:8080")
+response = harness.post_assistant(message=prompt, session_ref=None)
+
+print("assistant status:", response.get("status"))
+print("assistant response:", response.get("final_message"))
+print("session:", response.get("session_id"))
+print("run:", response.get("run_id"))
+
+if response.get("status") != "completed":
+    raise RuntimeError(f"assistant run did not complete: {response}")
+
+if not str(response.get("final_message") or "").strip():
+    raise RuntimeError(f"assistant returned no confirmation message: {response}")
+
+session_id = str(response["session_id"])
+turn = int(response["turn"])
+run_id = str(response["run_id"])
+
+trace_events = run_trace_events(session_id, turn)
+validated_calls = [
+    event
+    for event in trace_events
+    if event.get("run_id") == run_id
+    and event.get("event") == "model_tool_invocation_validated"
+    and event.get("output", {}).get("server_id") == "notification"
+    and event.get("output", {}).get("tool_name") == "notification_schedule"
+]
+
+if not validated_calls:
+    raise RuntimeError(
+        "assistant run did not contain a validated notification_schedule tool call"
+    )
+
+print("validated model tool call: notification_schedule")
+
+schedule_deadline = time.time() + 30
+schedule: dict | None = None
+while time.time() < schedule_deadline:
+    candidates = matching_new_schedules(
+        existing_ids=existing_schedule_ids,
+        target_utc=target_utc,
+    )
+    if len(candidates) == 1:
+        schedule = candidates[0]
+        break
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "multiple new notification schedules matched the smoke target: "
+            + json.dumps(candidates, sort_keys=True)
+        )
+    time.sleep(1)
+
+if schedule is None:
+    raise RuntimeError(
+        "new notification schedule for the smoke target was not found; "
+        "the assistant may have scheduled a different time or target"
+    )
+
+notification_id = str(schedule["id"])
+print("notification id:", notification_id)
+print("schedule status:", schedule.get("status"))
+print("next run UTC:", schedule.get("next_run_at_utc"))
+print("persisted reminder message:", schedule.get("message"))
+if schedule.get("message") != marker:
+    print("note: model normalized the reminder text; validation uses notification id")
+
+if schedule.get("status") != "active":
+    raise RuntimeError(f"new notification schedule is not active: {schedule}")
+
+if schedule.get("schedule", {}).get("schedule_type") != "once":
+    raise RuntimeError(f"assistant created the wrong schedule type: {schedule}")
+
+if "telegram" not in schedule.get("targets", []):
+    raise RuntimeError(f"assistant did not target Telegram: {schedule}")
+
+delivery_deadline = parse_utc(str(schedule["next_run_at_utc"])) + timedelta(minutes=3)
+
+while datetime.now(UTC) < delivery_deadline:
+    outbox_matches = [
+        record
+        for record in read_jsonl(OUTBOX_PATH)
+        if record.get("schedule_id") == notification_id
+        and record.get("status") == "sent"
+    ]
+    delivery_matches = [
+        record
+        for record in read_jsonl(DELIVERIES_PATH)
+        if record.get("schedule_id") == notification_id
+        and record.get("connector") == "telegram"
+        and record.get("status") == "sent"
+    ]
+    scheduler_delivered = [
+        record
+        for record in read_jsonl(SCHEDULER_LOG_PATH)
+        if record.get("notification_id") == notification_id
+        and record.get("event") == "telegram_connector_delivered"
+    ]
+    scheduler_succeeded = [
+        record
+        for record in read_jsonl(SCHEDULER_LOG_PATH)
+        if record.get("notification_id") == notification_id
+        and record.get("event") == "notification_delivery_succeeded"
+    ]
+    telegram_sent = [
+        record
+        for record in read_jsonl(TELEGRAM_LOG_PATH)
+        if record.get("notification_id") == notification_id
+        and record.get("event") == "outbound_notification_sent"
+        and int(record.get("sent_count", 0)) >= 1
+    ]
+
+    if (
+        outbox_matches
+        and delivery_matches
+        and scheduler_delivered
+        and scheduler_succeeded
+        and telegram_sent
+    ):
+        print("outbox: sent")
+        print("delivered message:", outbox_matches[-1].get("message"))
+        print("delivery connector: telegram / sent")
+        print("scheduler: telegram_connector_delivered")
+        print("scheduler: notification_delivery_succeeded")
+        print("telegram connector: outbound_notification_sent")
+        print("OK: real assistant Telegram reminder path validated")
+        raise SystemExit(0)
+
+    time.sleep(2)
+
+print("Real assistant Telegram reminder smoke failed.", file=sys.stderr)
+print("notification id:", notification_id, file=sys.stderr)
+print("marker:", marker, file=sys.stderr)
+show_recent("schedules", SCHEDULES_PATH)
+show_recent("outbox", OUTBOX_PATH)
+show_recent("deliveries", DELIVERIES_PATH)
+show_recent("scheduler logs", SCHEDULER_LOG_PATH, count=60)
+show_recent("Telegram outbound logs", TELEGRAM_LOG_PATH, count=60)
+raise SystemExit(1)
+PY

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+export PYTHONPATH="services/harness/src:mcp-servers/calendar-task/src:mcp-servers/notification-task/src:mcp-servers/dev-workspace/src:services/scheduler/src:${PYTHONPATH:-}"
+
+python3 -m pytest \
+  tests/unit/test_documentation_contract.py \
+  tests/unit/test_maintenance.py \
+  -q
+
+runtime_root="$(mktemp -d)"
+secret_root="$(mktemp -d)"
+trap 'rm -rf "$runtime_root" "$secret_root"' EXIT
+
+setup_output="$(
+  SAFEPLANE_HOME="$runtime_root/runtime" \
+  SAFEPLANE_SECRET_ROOT="$secret_root/secrets" \
+    make setup 2>&1
+)"
+if grep -q '\.env\.example' <<<"$setup_output"; then
+  echo "ERROR: setup still references the obsolete .env.example path" >&2
+  exit 1
+fi
+
+test ! -e "$runtime_root/runtime/secrets"
+./scripts/safeplane help >/dev/null
+
+echo "OK: documentation links, commands, contracts, runtime layout, and limitations passed"

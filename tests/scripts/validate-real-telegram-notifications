@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "Validating Telegram overlay compose config..."
+tests/scripts/compose-safeplane-notifications-telegram config >/tmp/safeplane-compose-telegram.yml
+
+echo "Compiling scheduler and Telegram connector..."
+PYTHONPATH=services/harness/src:services/scheduler/src:connectors/telegram/src \
+python3 -m py_compile \
+  services/scheduler/src/safeplane_scheduler/main.py \
+  connectors/telegram/src/telegram_connector/main.py
+
+echo "Building Telegram-enabled services..."
+tests/scripts/compose-safeplane-notifications-telegram build \
+  scheduler \
+  telegram-connector \
+  notification-task-mcp \
+  harness
+
+echo "Starting Telegram-enabled stack..."
+tests/scripts/compose-safeplane-notifications-telegram up -d \
+  model-gateway \
+  calendar-task-mcp \
+  notification-task-mcp \
+  harness \
+  telegram-connector \
+  scheduler
+
+echo "Checking internal health..."
+tests/scripts/compose-safeplane-notifications-telegram exec -T scheduler python - <<'PY'
+import time
+import urllib.request
+
+for url in [
+    "http://harness:8080/health",
+    "http://telegram-connector:8080/health",
+]:
+    last = None
+    for _ in range(30):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                print(url, response.status, response.read().decode())
+                break
+        except Exception as exc:
+            last = exc
+            time.sleep(2)
+    else:
+        raise RuntimeError(f"{url} not ready: {last}")
+PY
+
+echo "Cleaning notification state..."
+tests/scripts/compose-safeplane-notifications-telegram exec -T scheduler sh -lc '
+rm -f "$SAFEPLANE_HOME/data/notifications/schedules.jsonl"
+rm -f "$SAFEPLANE_HOME/data/notifications/outbox.jsonl"
+rm -f "$SAFEPLANE_HOME/data/notifications/deliveries.jsonl"
+rm -f "$SAFEPLANE_HOME/logs/scheduler/scheduler.jsonl"
+rm -f "$SAFEPLANE_HOME/logs/connectors/telegram/outbound-notifications.jsonl"
+mkdir -p "$SAFEPLANE_HOME/data/notifications"
+mkdir -p "$SAFEPLANE_HOME/logs/scheduler"
+mkdir -p "$SAFEPLANE_HOME/logs/connectors/telegram"
+'
+
+echo "Restarting scheduler and Telegram connector..."
+tests/scripts/compose-safeplane-notifications-telegram restart scheduler telegram-connector
+
+echo "Running real Telegram notification smoke..."
+tests/scripts/docker-smoke-notification-telegram
+
+echo
+echo "OK: real Telegram notification delivery validated"

@@ -1,0 +1,129 @@
+services:
+  harness:
+    environment:
+      SAFEPLANE_DEVELOPER_SOURCE_ROOT: /developer-source
+      SAFEPLANE_REPOSITORY_CONFIG: ${SAFEPLANE_REPOSITORY_CONFIG:-/data/safeplane/config/repositories.yaml}
+      SAFEPLANE_ARCHDOC_REPOSITORY_URL: ${SAFEPLANE_ARCHDOC_REPOSITORY_URL:-}
+      SAFEPLANE_ALLOW_LOCAL_GIT_FIXTURES: ${SAFEPLANE_ALLOW_LOCAL_GIT_FIXTURES:-no}
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/workspaces:/data/safeplane/workspaces
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/git-fixtures:/data/safeplane/git-fixtures:ro
+      - ${SAFEPLANE_DEV_SOURCE:-.}:/developer-source:ro
+      - dev-check-control:/run/safeplane-dev-check
+    depends_on:
+      model-gateway:
+        condition: service_healthy
+      calendar-task-mcp:
+        condition: service_healthy
+      notification-task-mcp:
+        condition: service_healthy
+      scheduler:
+        condition: service_healthy
+      dev-workspace-mcp:
+        condition: service_healthy
+      dev-workspace-apply-mcp:
+        condition: service_healthy
+      dev-check-mcp:
+        condition: service_started
+    networks:
+      - harness-egress
+      - harness-model
+      - harness-tools
+      - dev-workspace-internal
+
+  dev-workspace-mcp:
+    user: "10001:10001"
+    build:
+      context: .
+      dockerfile: mcp-servers/dev-workspace/Dockerfile
+    image: safeplane-dev-workspace-mcp:latest
+    environment:
+      SAFEPLANE_WORKSPACE_ROOT: /workspace
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/workspaces:/workspace:ro
+    networks:
+      - dev-workspace-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 64
+    cpus: "0.50"
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  dev-check-mcp:
+    user: "10001:10001"
+    build:
+      context: .
+      dockerfile: mcp-servers/dev-workspace/Dockerfile
+    image: safeplane-dev-workspace-mcp:latest
+    environment:
+      SAFEPLANE_WORKSPACE_ROOT: /workspace
+      SAFEPLANE_WORKSPACE_MODE: execute
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/workspaces:/workspace:ro
+      - dev-check-control:/run/safeplane-dev-check
+    network_mode: none
+    command:
+      - sh
+      - -lc
+      - rm -f /run/safeplane-dev-check/dev-check.sock && exec uvicorn dev_workspace_mcp.main:app --uds /run/safeplane-dev-check/dev-check.sock
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: "0.50"
+    mem_limit: 320m
+    pids_limit: 64
+    init: true
+
+  dev-workspace-apply-mcp:
+    user: "10001:10001"
+    build:
+      context: .
+      dockerfile: mcp-servers/dev-workspace/Dockerfile
+    image: safeplane-dev-workspace-mcp:latest
+    environment:
+      SAFEPLANE_WORKSPACE_ROOT: /workspace
+      SAFEPLANE_WORKSPACE_MODE: apply
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/workspaces:/workspace
+    networks:
+      - dev-workspace-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 64
+    cpus: "0.50"
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+networks:
+  dev-workspace-internal:
+    internal: true
+
+volumes:
+  dev-check-control:

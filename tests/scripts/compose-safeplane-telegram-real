@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+./scripts/prepare-runtime-layout >/dev/null
+
+exec docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.real.yml \
+  -f docker-compose.telegram.yml \
+  "$@"

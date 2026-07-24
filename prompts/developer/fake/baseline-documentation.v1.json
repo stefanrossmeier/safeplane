@@ -1,0 +1,15 @@
+{
+  "stage": "baseline",
+  "summary": "Prepared a concise repository documentation baseline for the fake developer pipeline.",
+  "documentation_files": [
+    "docs/REPO_MAP.md",
+    "docs/ARCHITECTURE.md",
+    "docs/API_SURFACE.md",
+    "docs/OPERATIONS.md"
+  ],
+  "changed": true,
+  "evidence_notes": [
+    "Fake-mode fixture evidence was used; no external archdoc skill was invoked."
+  ],
+  "uncertainties": []
+}

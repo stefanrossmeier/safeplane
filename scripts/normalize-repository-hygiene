@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+IGNORE_BLOCK = """# Safeplane repository hygiene
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+._*
+__MACOSX/
+*.patch
+*.diff
+*.zip
+*.tar
+*.tar.gz
+*.tmp
+.tmp/
+tmp/
+.safeplane/
+runtime/
+evidence-bundles/
+workspaces/
+traces/
+.env
+.env.*
+!.env.example
+secrets/
+*.secret
+compose.override.yml
+docker-compose.override.yml
+"""
+
+
+def ensure_gitignore() -> None:
+    path = ROOT / ".gitignore"
+    current = path.read_text(encoding="utf-8") if path.exists() else ""
+    missing = [line for line in IGNORE_BLOCK.splitlines() if line and line not in current.splitlines()]
+    if not missing:
+        return
+    separator = "" if not current or current.endswith("\n\n") else ("\n" if current.endswith("\n") else "\n\n")
+    addition = "# Safeplane repository hygiene\n" + "\n".join(
+        line for line in IGNORE_BLOCK.splitlines()[1:] if line and line not in current.splitlines()
+    ) + "\n"
+    path.write_text(current + separator + addition, encoding="utf-8")
+
+
+def remove_generated_artifacts() -> None:
+    generated: list[Path] = []
+    for directory in list(ROOT.rglob("__pycache__")) + [ROOT / "__MACOSX"]:
+        if directory.exists() and ".git" not in directory.parts:
+            generated.append(directory)
+    for pattern in ("*.pyc", "*.pyo", ".DS_Store", "._*"):
+        for path in ROOT.rglob(pattern):
+            if path.is_file() and ".git" not in path.parts:
+                generated.append(path)
+
+    git_dir = ROOT / ".git"
+    if git_dir.exists():
+        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).split(b"\0")
+        generated_tracked = []
+        for raw in tracked:
+            if not raw:
+                continue
+            relative = Path(raw.decode())
+            if (
+                "__pycache__" in relative.parts
+                or "__MACOSX" in relative.parts
+                or relative.name == ".DS_Store"
+                or relative.name.startswith("._")
+                or relative.suffix in {".pyc", ".pyo"}
+            ):
+                generated_tracked.append(relative.as_posix())
+        if generated_tracked:
+            subprocess.run(
+                ["git", "rm", "-r", "-f", "--ignore-unmatch", "--", *generated_tracked],
+                cwd=ROOT,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+
+    for path in sorted(set(generated), key=lambda item: len(item.parts), reverse=True):
+        if not path.exists():
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+def move_if_present(source: str, destination: str) -> None:
+    src = ROOT / source
+    dst = ROOT / destination
+    if not src.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        if src.read_bytes() == dst.read_bytes():
+            src.unlink()
+            return
+        raise SystemExit(f"refusing to overwrite existing historical file: {dst.relative_to(ROOT)}")
+    src.rename(dst)
+
+
+def archive_legacy_planning() -> None:
+    # The live planning document now lives at docs/BACKLOG.md.
+    # Only superseded planning copies under the legacy docs/mvp tree are archived.
+    move_if_present("docs/mvp/mvp-ladder.md", "docs/history/legacy-roadmap.md")
+    move_if_present("docs/mvp/cleanup-tasks.md", "docs/history/legacy-cleanup-tasks.md")
+    legacy_dir = ROOT / "docs" / "mvp"
+    if legacy_dir.exists() and not any(legacy_dir.iterdir()):
+        legacy_dir.rmdir()
+
+
+def main() -> None:
+    ensure_gitignore()
+    remove_generated_artifacts()
+    archive_legacy_planning()
+    print("OK: repository hygiene normalized")
+
+
+if __name__ == "__main__":
+    main()

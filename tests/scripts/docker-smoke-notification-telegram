@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+tests/scripts/compose-safeplane-notifications-telegram exec -T scheduler python - <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.request
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+safeplane_home = Path(os.environ["SAFEPLANE_HOME"])
+harness_url = "http://harness:8080"
+
+outbox_path = safeplane_home / "data/notifications/outbox.jsonl"
+deliveries_path = safeplane_home / "data/notifications/deliveries.jsonl"
+scheduler_log_path = safeplane_home / "logs/scheduler/scheduler.jsonl"
+telegram_log_path = safeplane_home / "logs/connectors/telegram/outbound-notifications.jsonl"
+
+print("container SAFEPLANE_HOME:", safeplane_home)
+print("outbox_path:", outbox_path)
+print("deliveries_path:", deliveries_path)
+print("scheduler_log_path:", scheduler_log_path)
+print("telegram_log_path:", telegram_log_path)
+print()
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return records
+
+
+def wait_for_url(url: str, label: str) -> None:
+    deadline = time.time() + 60
+    last_error = None
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                print(label + ":", response.status, response.read().decode())
+                return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2)
+
+    raise RuntimeError(f"{label} not ready: {last_error}")
+
+
+def broker_call(tool_name: str, arguments: dict) -> dict:
+    body = json.dumps({
+        "workflow_id": "assistant",
+        "server_id": "notification",
+        "tool_name": tool_name,
+        "arguments": arguments,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        harness_url + "/mcp/tools/call",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=20) as response:
+        raw = response.read().decode("utf-8")
+        print("broker response:", response.status, raw)
+        payload = json.loads(raw)
+
+    if payload.get("is_error"):
+        raise RuntimeError(payload)
+
+    return payload["structured_content"]
+
+
+wait_for_url(harness_url + "/health", "harness health")
+wait_for_url("http://telegram-connector:8080/health", "telegram connector health")
+
+now_utc = datetime.now(UTC)
+now_berlin = now_utc.astimezone(ZoneInfo("Europe/Berlin"))
+run_at_local = now_berlin + timedelta(seconds=20)
+
+message = "Safeplane NOTIFICATION real Telegram notification smoke " + now_utc.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+print("Scheduling Telegram notification:")
+print("run_at_local:", run_at_local.replace(microsecond=0).isoformat())
+print("message:", message)
+print()
+
+scheduled = broker_call(
+    "notification_schedule",
+    {
+        "payload": {
+            "payload_type": "static",
+            "message": message,
+        },
+        "schedule": {
+            "schedule_type": "once",
+            "run_at_local": run_at_local.replace(microsecond=0).isoformat(),
+            "timezone": "Europe/Berlin",
+        },
+        "targets": ["telegram"],
+        "grace_seconds": 120,
+    },
+)
+
+notification_id = scheduled["notification_id"]
+print("scheduled:", notification_id)
+print("next_run_at_utc:", scheduled["next_run_at_utc"])
+print()
+
+deadline = time.time() + 90
+
+while time.time() < deadline:
+    outbox_records = read_jsonl(outbox_path)
+    delivery_records = read_jsonl(deliveries_path)
+    scheduler_logs = read_jsonl(scheduler_log_path)
+    telegram_logs = read_jsonl(telegram_log_path)
+
+    outbox = [
+        r for r in outbox_records
+        if r.get("schedule_id") == notification_id and r.get("status") == "sent"
+    ]
+    deliveries = [
+        r for r in delivery_records
+        if r.get("schedule_id") == notification_id and r.get("status") == "sent"
+    ]
+    scheduler_hits = [
+        r for r in scheduler_logs
+        if r.get("event") == "telegram_connector_delivered"
+        and r.get("notification_id") == notification_id
+    ]
+    connector_hits = [
+        r for r in telegram_logs
+        if r.get("event") == "outbound_notification_sent"
+        and r.get("notification_id") == notification_id
+    ]
+
+    if outbox and deliveries and scheduler_hits and connector_hits:
+        print("outbox sent:", outbox[-1]["id"])
+        print("delivery sent:", deliveries[-1]["id"])
+        print("scheduler log: telegram_connector_delivered")
+        print("connector log: outbound_notification_sent")
+        print("message:", outbox[-1]["message"])
+        print()
+        print("OK")
+        raise SystemExit(0)
+
+    time.sleep(2)
+
+print("Telegram notification smoke failed.", file=sys.stderr)
+print("notification_id:", notification_id, file=sys.stderr)
+print("message:", message, file=sys.stderr)
+
+print("\nRecent outbox:", file=sys.stderr)
+for record in read_jsonl(outbox_path)[-20:]:
+    print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+print("\nRecent deliveries:", file=sys.stderr)
+for record in read_jsonl(deliveries_path)[-20:]:
+    print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+print("\nRecent scheduler logs:", file=sys.stderr)
+for record in read_jsonl(scheduler_log_path)[-40:]:
+    print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+print("\nRecent telegram connector logs:", file=sys.stderr)
+for record in read_jsonl(telegram_log_path)[-40:]:
+    print(json.dumps(record, sort_keys=True), file=sys.stderr)
+
+raise SystemExit(1)
+PY

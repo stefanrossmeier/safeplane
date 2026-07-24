@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-fake"
+PROJECT="${SAFEPLANE_DEVELOPER_TOOLS_PROJECT:-safeplane-developer-tools-smoke}"
+PORT="${SAFEPLANE_DEVELOPER_TOOLS_PORT:-8798}"
+if [[ -n "${SAFEPLANE_DEVELOPER_TOOLS_HOME:-}" ]]; then
+  HOME_DIR="$SAFEPLANE_DEVELOPER_TOOLS_HOME"
+  HOME_CREATED=no
+else
+  HOME_DIR="$(mktemp -d)"
+  HOME_CREATED=yes
+fi
+KEEP="${SAFEPLANE_DEVELOPER_TOOLS_KEEP:-no}"
+
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export SAFEPLANE_HOME="$HOME_DIR"
+export SAFEPLANE_HARNESS_PORT="$PORT"
+export SAFEPLANE_DEV_SOURCE="$ROOT/tests/fixtures/developer-repo"
+export SAFEPLANE_REPOSITORY_CONFIG="/data/safeplane/config/repositories.yaml"
+export SAFEPLANE_ALLOW_LOCAL_GIT_FIXTURES=yes
+
+mkdir -p "$SAFEPLANE_HOME/workspaces" "$SAFEPLANE_HOME/config" "$SAFEPLANE_HOME/git-fixtures"
+chmod 0755 "$SAFEPLANE_HOME/workspaces"
+
+cleanup() {
+  if [[ "$KEEP" != "yes" ]]; then
+    cleanup_image="$("$COMPOSE" images -q harness 2>/dev/null | head -n 1 || true)"
+    "$COMPOSE" down --remove-orphans --volumes >/dev/null 2>&1 || true
+    if [[ "$HOME_CREATED" == "yes" ]]; then
+      "$ROOT/tests/scripts/remove-container-owned-tree" "$HOME_DIR" "$cleanup_image"
+    fi
+  else
+    echo "Keeping developer MCP toolset smoke runtime: project=$PROJECT SAFEPLANE_HOME=$HOME_DIR"
+  fi
+}
+trap cleanup EXIT
+
+create_bare_repo() {
+  local name="$1"
+  local work="$SAFEPLANE_HOME/git-fixtures/${name}-work"
+  local bare="$SAFEPLANE_HOME/git-fixtures/${name}.git"
+  rm -rf "$work" "$bare"
+  mkdir -p "$work"
+  git -C "$work" init -q -b main
+  git -C "$work" config user.name "Safeplane fixture"
+  git -C "$work" config user.email "fixture@example.invalid"
+  if [[ "$name" == "target" ]]; then
+    mkdir -p "$work/src" "$work/checks"
+    printf '%s\n' '# developer MCP toolset target fixture' > "$work/README.md"
+    printf '%s\n' 'VALUE = 1' > "$work/src/app.py"
+    cat > "$work/src/greeter.py" <<'PY'
+def greet(name: str) -> str:
+    return f"Hello, {name}!"
+PY
+    cat > "$work/checks/check_greeting.py" <<'PY'
+from pathlib import Path
+content = Path("src/greeter.py").read_text(encoding="utf-8")
+assert "Hello from the developer pipeline" in content, content
+print("controlled greeting check passed")
+PY
+    cat > "$work/checks/pass.py" <<'PY'
+import os
+print("PASS")
+print(",".join(sorted(key for key in os.environ if key.startswith(("SAFEPLANE_", "GITHUB_")))))
+PY
+    cat > "$work/checks/fail.py" <<'PY'
+import sys
+print("FAIL", file=sys.stderr)
+raise SystemExit(7)
+PY
+    cat > "$work/checks/slow.py" <<'PY'
+import time
+time.sleep(10)
+PY
+  else
+    mkdir -p "$work/skills/archdoc"
+    printf '%s\n' '# External archdoc fixture' 'Only the documentation agent may read this.' > "$work/skills/archdoc/SKILL.md"
+  fi
+  git -C "$work" add .
+  git -C "$work" commit -qm "fixture"
+  git clone -q --bare "$work" "$bare"
+  git -C "$work" rev-parse HEAD
+}
+
+target_commit="$(create_bare_repo target)"
+skill_commit="$(create_bare_repo skills)"
+export SAFEPLANE_ARCHDOC_REPOSITORY_URL="file:///data/safeplane/git-fixtures/skills.git"
+
+cat > "$SAFEPLANE_HOME/config/repositories.yaml" <<'YAML'
+version: 1
+credential_profiles: {}
+repository_profiles:
+  developer_tools-fixture:
+    enabled: true
+    repository_url: file:///data/safeplane/git-fixtures/target.git
+    ref: main
+    allowed_hosts: []
+    allowed_repository: null
+    credential_profile: null
+    allow_file_url: true
+    remote_write_allowed: false
+    branch_prefix: safeplane/
+YAML
+
+wait_health() {
+  local url="$1"
+  local deadline=$((SECONDS + 120))
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for $url" >&2
+      "$COMPOSE" ps >&2 || true
+      "$COMPOSE" logs harness dev-workspace-mcp dev-check-mcp >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+echo "Starting isolated developer MCP toolset developer tool stack..."
+"$COMPOSE" up -d --build \
+  model-gateway calendar-task-mcp notification-task-mcp scheduler \
+  dev-workspace-mcp dev-workspace-apply-mcp dev-check-mcp harness
+wait_health "http://127.0.0.1:${PORT}/health"
+socket_deadline=$((SECONDS + 30))
+until "$COMPOSE" exec -T harness test -S /run/safeplane-dev-check/dev-check.sock >/dev/null 2>&1; do
+  if (( SECONDS >= socket_deadline )); then
+    echo "Timed out waiting for the dev-check Unix socket" >&2
+    "$COMPOSE" logs dev-check-mcp harness >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+response_file="$(mktemp)"
+if ! http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PORT}/connector/develop" \
+  -H 'Content-Type: application/json' \
+  -d '{"connector":"cli","repository_profile":"developer_tools-fixture","message":"Prepare the developer MCP toolset developer tool fixture"}')"; then
+  echo "Developer run request failed before an HTTP response was received" >&2
+  cat "$response_file" >&2 || true
+  rm -f "$response_file"
+  exit 1
+fi
+response="$(cat "$response_file")"
+rm -f "$response_file"
+if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+  echo "Developer run returned HTTP $http_status" >&2
+  printf '%s\n' "$response" >&2
+  exit 1
+fi
+run_id="$(python3 - "$response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+print(response["run_id"])
+PY
+)"
+
+python3 - "$PORT" "$SAFEPLANE_HOME" "$run_id" "$target_commit" "$skill_commit" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.error
+import urllib.request
+
+port, home_raw, run_id, target_commit, skill_commit = sys.argv[1:]
+home = pathlib.Path(home_raw)
+run = json.loads((home / "runs" / f"{run_id}.json").read_text())
+base = f"http://127.0.0.1:{port}/mcp/tools/call"
+
+
+def call(server, tool, arguments, *, agent_id=None, expected=200):
+    payload = {
+        "workflow_id": "developer",
+        "server_id": server,
+        "tool_name": tool,
+        "arguments": arguments,
+        "session_id": run["session_id"],
+        "turn": run["turn"],
+        "run_id": run_id,
+        "connector": "developer_tools-smoke",
+    }
+    if agent_id:
+        payload["agent_id"] = agent_id
+    request = urllib.request.Request(
+        base,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            status = response.status
+            body = response.read().decode()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        body = exc.read().decode()
+    assert status == expected, (status, body)
+    return json.loads(body)
+
+metadata = call("dev-workspace", "dev_git_metadata", {"include_remote": True})["structured_content"]
+assert metadata["head_commit"] == target_commit, metadata
+assert metadata["resolved_base_commit"] == target_commit, metadata
+assert metadata["requested_ref"] == "main", metadata
+
+tracked = call(
+    "dev-workspace",
+    "dev_git_tracked_files",
+    {"path": ".", "max_results": 100},
+)["structured_content"]
+assert "checks/pass.py" in tracked["files"], tracked
+assert "src/app.py" in tracked["files"], tracked
+
+status = call("dev-workspace", "dev_git_status", {"include_untracked": True})["structured_content"]
+assert status["clean"] is False, status
+status_entries = {
+    item["path"]: (item["index_status"], item["worktree_status"])
+    for item in status["entries"]
+}
+assert status_entries == {
+    "src/greeter.py": (" ", "M"),
+    "docs/API_SURFACE.md": ("?", "?"),
+    "docs/ARCHITECTURE.md": ("?", "?"),
+    "docs/OPERATIONS.md": ("?", "?"),
+    "docs/REPO_MAP.md": ("?", "?"),
+}, status
+
+skill = call(
+    "dev-workspace",
+    "dev_external_skill_read",
+    {
+        "source_id": "archdoc",
+        "path": "SKILL.md",
+        "start_line": 1,
+        "max_lines": 50,
+        "max_bytes": 4096,
+    },
+    agent_id="documentation",
+)["structured_content"]
+assert skill["source_commit"] == skill_commit, skill
+assert "Only the documentation agent" in skill["content"], skill
+
+call(
+    "dev-workspace",
+    "dev_external_skill_read",
+    {
+        "source_id": "archdoc",
+        "path": "SKILL.md",
+        "start_line": 1,
+        "max_lines": 50,
+        "max_bytes": 4096,
+    },
+    agent_id="analysis",
+    expected=403,
+)
+
+passed = call(
+    "dev-check",
+    "dev_check_run",
+    {"profile_id": "python_check", "arguments": ["checks/pass.py"]},
+)["structured_content"]
+assert passed["status"] == "passed", passed
+assert passed["stdout"] == "", passed
+assert passed["stderr"] == "", passed
+assert passed["network_policy"] == "disabled", passed
+assert not any(key.startswith(("SAFEPLANE_", "GITHUB_")) for key in passed["environment_keys"]), passed
+stdout = (home / passed["stdout_ref"]).read_text()
+assert stdout.splitlines() == ["PASS", ""], stdout
+assert (home / passed["stderr_ref"]).is_file()
+
+failed = call(
+    "dev-check",
+    "dev_check_run",
+    {"profile_id": "python_check", "arguments": ["checks/fail.py"]},
+)["structured_content"]
+assert failed["status"] == "failed", failed
+assert failed["exit_code"] == 7, failed
+assert "FAIL" in (home / failed["stderr_ref"]).read_text()
+
+timed_out = call(
+    "dev-check",
+    "dev_check_run",
+    {"profile_id": "python_check", "arguments": ["checks/slow.py"], "timeout_seconds": 1},
+)["structured_content"]
+assert timed_out["status"] == "timed_out", timed_out
+assert timed_out["duration_ms"] < 5000, timed_out
+
+call(
+    "dev-check",
+    "dev_check_run",
+    {"profile_id": "python_check", "arguments": ["checks/pass.py", "&&", "echo"]},
+    expected=422,
+)
+call(
+    "dev-check",
+    "dev_check_run",
+    {"profile_id": "bash", "arguments": ["checks/pass.py"]},
+    expected=502,
+)
+call(
+    "dev-check",
+    "dev_check_run",
+    {"profile_id": "python_check", "arguments": ["../outside.py"]},
+    expected=502,
+)
+
+print(f"Git tools: target={target_commit}")
+print(f"External skill: archdoc={skill_commit} documentation-only")
+print("Checks: pass, fail, timeout, shell rejection, undeclared profile rejection")
+PY
+
+# Exercise the approval-required patch tool through the harness broker with a plan budget.
+patch_result="$("$COMPOSE" exec -T harness python - "$run_id" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from harness.mcp_broker import McpToolBroker
+from harness.patch_approval_store import create_patch_approval, prepare_patch_apply_workspace, sha256_text
+from harness.run_store import load_run
+
+run_id = sys.argv[1]
+home = Path('/data/safeplane')
+run = load_run(home, run_id)
+patch = (
+    'diff --git a/README.md b/README.md\n'
+    '--- a/README.md\n'
+    '+++ b/README.md\n'
+    '@@ -1 +1 @@\n'
+    '-# developer MCP toolset target fixture\n'
+    '+# developer MCP toolset target fixture updated\n'
+)
+proposal = {
+    'proposal_id': 'patch_proposal_developer_tools_smoke',
+    'patch_ref': f'workspaces/{run_id}/artifacts/patch_proposal_developer_tools_smoke.patch',
+    'patch_sha256': sha256_text(patch),
+}
+approval, token = create_patch_approval(home, run=run, proposal=proposal, connector='developer_tools-smoke')
+prepare_patch_apply_workspace(home, run_id=run_id, approval_id=approval['approval_id'])
+broker = McpToolBroker(config_path=Path('/app/safeplane.yaml'), safeplane_home=home)
+response = broker.call_tool({
+    'workflow_id': 'developer',
+    'server_id': 'dev-workspace-apply',
+    'tool_name': 'dev_workspace_apply_patch',
+    'arguments': {
+        'proposal_id': proposal['proposal_id'],
+        'patch': patch,
+        'patch_sha256': proposal['patch_sha256'],
+        'authorization_source': 'developer_pipeline_plan',
+        'plan_budget': [{
+            'path': 'README.md',
+            'operation': 'modified',
+            'max_changed_lines': 2,
+            'max_hunks': 1,
+        }],
+    },
+    'session_id': run['session_id'],
+    'turn': run['turn'],
+    'run_id': run_id,
+    'connector': 'developer_tools-smoke',
+    'approval_id': approval['approval_id'],
+    'approval_token': token,
+})
+print(json.dumps(response.structured_content))
+PY
+)"
+
+python3 - "$patch_result" "$SAFEPLANE_HOME" <<'PY'
+import json, pathlib, sys
+result = json.loads(sys.argv[1])
+home = pathlib.Path(sys.argv[2])
+assert result['authorization_source'] == 'developer_pipeline_plan', result
+assert result['plan_budget_result']['status'] == 'passed', result
+assert result['plan_budget_result']['checked_paths'] == ['README.md'], result
+assert result['diff_size_bytes'] > 0, result
+assert result['changed_files'][0]['operation'] == 'modified', result
+assert result['changed_files'][0]['before_sha256'], result
+assert result['changed_files'][0]['after_sha256'], result
+assert result['tool_evidence_path'] == result['evidence_ref'], result
+assert (home / result['tool_evidence_path']).is_file(), result
+PY
+
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/target.git" rev-parse HEAD)" == "$target_commit" ]]
+[[ "$(git --git-dir="$SAFEPLANE_HOME/git-fixtures/skills.git" rev-parse HEAD)" == "$skill_commit" ]]
+
+echo "Patch evidence: plan budget passed with before/after hashes"
+echo "Source fixture remotes remained unchanged"
+echo "OK: developer MCP toolset complete developer MCP toolset passed"

@@ -1,0 +1,12 @@
+{
+  "type": "tool_call",
+  "server_id": "dev-workspace",
+  "tool_name": "dev_workspace_grep",
+  "arguments": {
+    "query": "Hello",
+    "path": "src",
+    "file_glob": "*.py",
+    "case_sensitive": true,
+    "max_results": 20
+  }
+}

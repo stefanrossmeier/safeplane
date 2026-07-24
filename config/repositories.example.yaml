@@ -1,0 +1,24 @@
+version: 1
+
+credential_profiles:
+  github:
+    type: github_token_file
+    secret_path: /run/secrets/github_token
+    username: x-access-token
+
+repository_profiles:
+  example-target:
+    enabled: false
+    repository_url: https://github.com/OWNER/REPOSITORY.git
+    ref: main
+    allowed_hosts:
+      - github.com
+    allowed_repository: OWNER/REPOSITORY
+    credential_profile: github
+    allow_file_url: false
+    remote_write_allowed: false
+    draft_pr_creation: approval_required
+    branch_prefix: safeplane/
+    pull_request_repository: OWNER/REPOSITORY
+    git_author_name: Safeplane
+    git_author_email: safeplane@example.invalid

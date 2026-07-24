@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+tests/scripts/test-notifications
+tests/scripts/docker-config
+tests/scripts/docker-build-notification-stack
+tests/scripts/docker-up-notification-stack
+tests/scripts/docker-smoke-notification-services
+tests/scripts/docker-smoke-notification-broker
+tests/scripts/docker-smoke-notification-due
+tests/scripts/docker-smoke-notification-recurring
+tests/scripts/docker-smoke-notification-calendar-digest

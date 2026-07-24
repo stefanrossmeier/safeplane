@@ -1,0 +1,7 @@
+prompt_id: slow.none
+current_version: v1
+
+versions:
+  v1:
+    file: system.v1.md
+    description: Placeholder prompt for model-free slow workflow

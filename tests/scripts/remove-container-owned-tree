@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+path="${1:?usage: remove-container-owned-tree PATH [IMAGE]}"
+image="${2:-}"
+
+if [[ ! -e "$path" ]]; then
+  exit 0
+fi
+
+# Host-owned trees need no Docker fallback.
+if rm -rf -- "$path" 2>/dev/null; then
+  exit 0
+fi
+
+if [[ -z "$image" ]]; then
+  echo "ERROR: cannot remove container-owned runtime tree and no cleanup image is available: $path" >&2
+  exit 1
+fi
+
+# Rootful Docker maps container root to host root. Use the already-built harness
+# image only as a narrow, networkless cleanup environment for the temporary bind
+# mount. The source checkout and all other host paths remain unmounted.
+docker run --rm \
+  --network none \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --user 0:0 \
+  --cap-drop ALL \
+  --cap-add DAC_OVERRIDE \
+  --cap-add FOWNER \
+  --security-opt no-new-privileges:true \
+  --mount "type=bind,source=$path,target=/cleanup" \
+  --entrypoint python \
+  "$image" \
+  -c '
+from pathlib import Path
+import shutil
+
+root = Path("/cleanup")
+for child in root.iterdir():
+    if child.is_symlink() or child.is_file():
+        child.unlink()
+    else:
+        shutil.rmtree(child)
+'
+
+rmdir -- "$path"

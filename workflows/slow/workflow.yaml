@@ -1,0 +1,39 @@
+workflow_id: slow
+version: 0.1.0
+description: Model-free workflow used to test run-manager concurrency.
+supported_entrypoints:
+- slow
+examples:
+- '5'
+- '8'
+prompt:
+  id: slow.none
+  version: v1
+  path: /app/prompts/slow/system.v1.md
+model_profiles:
+  default:
+    litellm_model: none
+    temperature: 0
+    max_tokens: 0
+session:
+  receives_history: true
+concurrency:
+  same_session: serial
+  different_sessions: parallel_allowed
+mcp:
+  servers: []
+  max_tool_call_retries: 5
+  allowed_servers: {}
+tools:
+  enabled: false
+  allowed: []
+functions:
+  enabled: false
+  allowed: []
+io:
+  input:
+    messages: list
+  output:
+    final_message: string
+deterministic_tools:
+  enabled: []

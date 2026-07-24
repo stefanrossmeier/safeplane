@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ "${1:-}" = "help" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  cat <<'EOF'
+Safeplane operator commands
+
+  safeplane chat <message>                  Send a chat message
+  safeplane develop --repo <id> <task>      Start a developer workflow
+  safeplane status [run-id]                 Inspect a run
+  safeplane approve-pr <run-id>             Retry/manual draft-PR creation
+  safeplane evidence [latest|run-id]        Collect run evidence into one directory
+  safeplane case-study <run-id> ...         Generate sanitized public evidence
+  safeplane maintenance storage             Show runtime disk usage
+  safeplane maintenance clean --dry-run     Preview old trace/workspace cleanup
+  safeplane maintenance clean               Delete old inactive traces/workspaces
+  safeplane calendar --help                 Calendar commands
+
+See docs/scripts.md for the full task-oriented guide.
+EOF
+  exit 0
+fi
+
+if [ "${1:-}" = "maintenance" ]; then
+  shift
+  exec "$SCRIPT_DIR/safeplane-maintenance" "$@"
+fi
+
+if [ "${1:-}" = "calendar" ]; then
+  shift
+  exec "$SCRIPT_DIR/safeplane-calendar" "$@"
+fi
+
+if [ "${1:-}" = "case-study" ]; then
+  shift
+  exec "$SCRIPT_DIR/safeplane-case-study" "$@"
+fi
+
+if [ "${1:-}" = "evidence" ]; then
+  shift
+  exec "$SCRIPT_DIR/safeplane-evidence" "$@"
+fi
+
+exec "$SCRIPT_DIR/safeplane-chat" "$@"

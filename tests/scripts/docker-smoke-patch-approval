@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+COMPOSE="$ROOT/tests/scripts/compose-safeplane-developer-fake"
+PROJECT="${SAFEPLANE_PATCH_APPROVAL_PROJECT:-safeplane-patch-approval-smoke}"
+PORT="${SAFEPLANE_PATCH_APPROVAL_PORT:-8795}"
+if [[ -n "${SAFEPLANE_PATCH_APPROVAL_HOME:-}" ]]; then
+  HOME_DIR="$SAFEPLANE_PATCH_APPROVAL_HOME"
+  HOME_CREATED=no
+else
+  HOME_DIR="$(mktemp -d)"
+  HOME_CREATED=yes
+fi
+KEEP="${SAFEPLANE_PATCH_APPROVAL_KEEP:-no}"
+
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export SAFEPLANE_HOME="$HOME_DIR"
+export SAFEPLANE_HARNESS_PORT="$PORT"
+export SAFEPLANE_DEV_SOURCE="$ROOT/tests/fixtures/developer-repo"
+
+mkdir -p "$SAFEPLANE_HOME/workspaces"
+chmod 0755 "$SAFEPLANE_HOME/workspaces"
+
+cleanup() {
+  if [[ "$KEEP" != "yes" ]]; then
+    cleanup_image="$("$COMPOSE" images -q harness 2>/dev/null | head -n 1 || true)"
+    "$COMPOSE" down --remove-orphans --volumes >/dev/null 2>&1 || true
+    if [[ "$HOME_CREATED" == "yes" ]]; then
+      "$ROOT/tests/scripts/remove-container-owned-tree" "$HOME_DIR" "$cleanup_image"
+    fi
+  else
+    echo "Keeping patch approval workflow smoke runtime: project=$PROJECT SAFEPLANE_HOME=$HOME_DIR"
+  fi
+}
+trap cleanup EXIT
+
+wait_health() {
+  local url="$1"
+  local deadline=$((SECONDS + 90))
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for $url" >&2
+      "$COMPOSE" ps >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+wait_container_health() {
+  local service="$1"
+  local container_id
+  container_id="$($COMPOSE ps -q "$service")"
+  [[ -n "$container_id" ]] || { echo "$service container missing" >&2; exit 1; }
+  local deadline=$((SECONDS + 90))
+  until docker exec "$container_id" python -c \
+    'import urllib.request; response = urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2); raise SystemExit(0 if response.status == 200 else 1)' \
+    >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for container health: $service" >&2
+      "$COMPOSE" logs "$service" >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+json_post() {
+  local url="$1"
+  local payload="$2"
+  curl -fsS -X POST "$url" -H 'Content-Type: application/json' -d "$payload"
+}
+
+echo "Starting isolated fake-mode patch approval stack..."
+"$COMPOSE" up -d --build \
+  model-gateway calendar-task-mcp notification-task-mcp scheduler \
+  dev-workspace-mcp dev-workspace-apply-mcp harness
+
+wait_health "http://127.0.0.1:${PORT}/health"
+wait_container_health dev-workspace-mcp
+wait_container_health dev-workspace-apply-mcp
+
+echo "Creating a developer run and inert patch proposal..."
+response="$(json_post "http://127.0.0.1:${PORT}/connector/developer" \
+  '{"connector":"cli","message":"developer list ."}')"
+
+run_and_session="$(python3 - "$response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "completed", response
+print(f'{response["run_id"]}|{response["session_id"]}')
+PY
+)"
+IFS='|' read -r run_id session_id <<EOF_IDS
+$run_and_session
+EOF_IDS
+
+patch_payload="$(python3 - "$run_id" "$session_id" <<'PY'
+import json, sys
+patch = """diff --git a/src/greeter.py b/src/greeter.py
+--- a/src/greeter.py
++++ b/src/greeter.py
+@@ -1,2 +1,2 @@
+ def greet(name: str) -> str:
+-    return f\"Hello, {name}!\"
++    return f\"Hello after approval, {name}!\"
+"""
+print(json.dumps({
+    "workflow_id": "developer",
+    "server_id": "dev-workspace",
+    "tool_name": "dev_workspace_propose_patch",
+    "arguments": {
+        "summary": "Change the fixture greeting after explicit approval",
+        "patch": patch,
+    },
+    "session_id": sys.argv[2],
+    "turn": 1,
+    "run_id": sys.argv[1],
+    "connector": "patch_approval-smoke",
+}))
+PY
+)"
+proposal_response="$(json_post "http://127.0.0.1:${PORT}/mcp/tools/call" "$patch_payload")"
+proposal_values="$(python3 - "$proposal_response" <<'PY'
+import hashlib, json, sys
+response = json.loads(sys.argv[1])
+content = response["structured_content"]
+assert content["proposal_id"].startswith("patch_proposal_"), response
+assert content["approval_command"].startswith("safeplane approve-patch "), response
+print("|".join([
+    content["proposal_id"],
+    hashlib.sha256(content["patch"].encode()).hexdigest(),
+    content["approval_command"],
+]))
+PY
+)"
+IFS='|' read -r proposal_id patch_sha256 approval_command <<EOF_PROPOSAL
+$proposal_values
+EOF_PROPOSAL
+
+workspace="$SAFEPLANE_HOME/workspaces/$run_id/repo"
+grep -q 'Hello, {name}!' "$workspace/src/greeter.py"
+grep -q 'Hello, {name}!' "$ROOT/tests/fixtures/developer-repo/src/greeter.py"
+if grep -q 'Hello after approval' "$workspace/src/greeter.py"; then
+  echo "proposal modified the workspace before approval" >&2
+  exit 1
+fi
+
+echo "Proposal: $proposal_id"
+echo "Approval command: $approval_command"
+
+echo "Verifying the approval-only MCP tool cannot be called directly..."
+direct_apply_payload="$(python3 - "$run_id" "$session_id" "$proposal_id" "$patch_sha256" <<'PY'
+import json, pathlib, sys
+home = pathlib.Path(__import__('os').environ['SAFEPLANE_HOME'])
+patch = (home / 'workspaces' / sys.argv[1] / 'artifacts' / f'{sys.argv[3]}.patch').read_text()
+print(json.dumps({
+    "workflow_id": "developer",
+    "server_id": "dev-workspace-apply",
+    "tool_name": "dev_workspace_apply_patch",
+    "arguments": {
+        "proposal_id": sys.argv[3],
+        "patch": patch,
+        "patch_sha256": sys.argv[4],
+    },
+    "session_id": sys.argv[2],
+    "turn": 1,
+    "run_id": sys.argv[1],
+    "connector": "patch_approval-direct-denial",
+}))
+PY
+)"
+direct_file="$(mktemp)"
+direct_status="$(curl -sS -o "$direct_file" -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PORT}/mcp/tools/call" \
+  -H 'Content-Type: application/json' \
+  -d "$direct_apply_payload")"
+[[ "$direct_status" == "403" ]] || {
+  echo "expected direct patch apply to be denied with HTTP 403, got $direct_status" >&2
+  cat "$direct_file" >&2
+  exit 1
+}
+grep -q 'internal approval token' "$direct_file"
+rm -f "$direct_file"
+
+echo "Starting an assistant request concurrently with approval..."
+assistant_file="$(mktemp)"
+curl -fsS -X POST "http://127.0.0.1:${PORT}/connector/assistant" \
+  -H 'Content-Type: application/json' \
+  -d '{"connector":"cli","message":"Reply with exactly: assistant remained available"}' \
+  >"$assistant_file" &
+assistant_pid=$!
+
+approval_response="$(json_post \
+  "http://127.0.0.1:${PORT}/runs/${run_id}/patches/${proposal_id}/approve" \
+  '{"approved":true}')"
+wait "$assistant_pid"
+python3 - "$assistant_file" <<'PY'
+import json, pathlib, sys
+response = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert response["status"] == "completed", response
+PY
+rm -f "$assistant_file"
+
+approval_id="$(python3 - "$approval_response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert response["status"] == "applied", response
+assert response["changed_files"] == [response["changed_files"][0]], response
+assert response["changed_files"][0]["path"] == "src/greeter.py", response
+assert response["changed_files"][0]["operation"] == "modified", response
+print(response["approval_id"])
+PY
+)"
+
+grep -q 'Hello after approval, {name}!' "$workspace/src/greeter.py"
+grep -q 'Hello, {name}!' "$ROOT/tests/fixtures/developer-repo/src/greeter.py"
+if grep -q 'Hello after approval' "$ROOT/tests/fixtures/developer-repo/src/greeter.py"; then
+  echo "host source fixture was modified" >&2
+  exit 1
+fi
+mode="$(stat -c '%a' "$workspace/src/greeter.py" 2>/dev/null || stat -f '%Lp' "$workspace/src/greeter.py")"
+[[ "$mode" != *"2" && "$mode" != *"3" && "$mode" != *"6" && "$mode" != *"7" ]] || {
+  echo "published workspace file still has write bits: mode=$mode" >&2
+  exit 1
+}
+
+read_payload="$(python3 - "$run_id" "$session_id" <<'PY'
+import json, sys
+print(json.dumps({
+    "workflow_id": "developer",
+    "server_id": "dev-workspace",
+    "tool_name": "dev_workspace_read",
+    "arguments": {
+        "path": "src/greeter.py",
+        "start_line": 1,
+        "max_lines": 20,
+        "max_bytes": 4096,
+    },
+    "session_id": sys.argv[2],
+    "turn": 1,
+    "run_id": sys.argv[1],
+    "connector": "patch_approval-read-after-apply",
+}))
+PY
+)"
+read_response="$(json_post "http://127.0.0.1:${PORT}/mcp/tools/call" "$read_payload")"
+python3 - "$read_response" <<'PY'
+import json, sys
+response = json.loads(sys.argv[1])
+assert "Hello after approval" in response["structured_content"]["content"], response
+PY
+
+approval_record="$SAFEPLANE_HOME/workspaces/$run_id/approvals/$approval_id.json"
+evidence="$SAFEPLANE_HOME/workspaces/$run_id/evidence/tool-calls.jsonl"
+trace="$SAFEPLANE_HOME/traces/$session_id/turn_001/harness.trace.jsonl"
+[[ -f "$approval_record" ]] || { echo "approval record missing" >&2; exit 1; }
+[[ -f "$evidence" ]] || { echo "tool evidence missing" >&2; exit 1; }
+[[ -f "$trace" ]] || { echo "harness trace missing" >&2; exit 1; }
+grep -q '"status": "applied"' "$approval_record"
+grep -q 'dev_workspace_apply_patch' "$evidence"
+grep -q 'patch_approval_granted' "$trace"
+grep -q 'patch_file_written' "$trace"
+grep -q 'patch_apply_completed' "$trace"
+
+duplicate_file="$(mktemp)"
+duplicate_status="$(curl -sS -o "$duplicate_file" -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PORT}/runs/${run_id}/patches/${proposal_id}/approve" \
+  -H 'Content-Type: application/json' \
+  -d '{"approved":true}')"
+[[ "$duplicate_status" == "409" ]] || {
+  echo "expected duplicate approval to fail with HTTP 409, got $duplicate_status" >&2
+  cat "$duplicate_file" >&2
+  exit 1
+}
+rm -f "$duplicate_file"
+
+echo "Approval: $approval_id"
+echo "Changed file: src/greeter.py"
+echo "Source fixture remained unchanged"
+echo "Assistant request completed during approval"
+echo "OK: patch approval workflow explicit patch approval smoke passed"

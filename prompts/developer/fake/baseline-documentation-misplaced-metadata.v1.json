@@ -1,0 +1,21 @@
+{
+  "stage": "baseline",
+  "summary": "Created architecture documentation while returning descriptive metadata in the wrong nesting level.",
+  "documentation_files": [
+    "docs/ARCHITECTURE.md"
+  ],
+  "changed": true,
+  "replacements": [
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "old_text": "",
+      "new_text": "# Architecture\n\n> Generated with `ai-craftkit` skill: `archdoc`\n> Source: `ai-craftkit` at commit `${ARCHDOC_COMMIT}`\n> Skill bundle SHA-256: `${ARCHDOC_SKILL_SHA256}`\n> Prompt: `${DOCUMENTATION_PROMPT}`\n> Repository profile: `${REPOSITORY_PROFILE}`\n\nDoc Status: DRAFT\nSource Basis: repository files supplied through Safeplane MCP tools and the external archdoc skill\n",
+      "evidence_notes": [
+        "Verified repository evidence was complete."
+      ],
+      "uncertainties": [
+        "Runtime behavior was not executed during documentation."
+      ]
+    }
+  ]
+}

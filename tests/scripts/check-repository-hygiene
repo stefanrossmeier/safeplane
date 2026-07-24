@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+HISTORY_PREFIXES = ("docs/adr/", "docs/history/")
+LIVE_ROADMAP = "docs/BACKLOG.md"
+GENERATED_PARTS = {"__pycache__", "__MACOSX"}
+GENERATED_NAMES = {".DS_Store"}
+MILESTONE_TEXT = re.compile(r"(?i)\bmvp(?:\s*\d|\d)")
+MILESTONE_PATH = re.compile(r"(?i)(?:^|[./_-])mvp(?:\d|[./_-])")
+SCRIPT_REFERENCE = re.compile(r"(?<![A-Za-z0-9_.-])(tests/scripts/[A-Za-z0-9._-]+|\./scripts/[A-Za-z0-9._-]+)")
+OBSOLETE_SURFACE = re.compile(
+    r"(?i)(?:validate-mvp|compose-mvp|docker-(?:build|up|logs|smoke)-mvp|docker-compose\.mvp)"
+)
+
+
+def tracked_and_untracked() -> list[str]:
+    raw = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=ROOT,
+    )
+    return sorted({item.decode() for item in raw.split(b"\0") if item})
+
+
+def is_history(path: str) -> bool:
+    return path == LIVE_ROADMAP or path.startswith(HISTORY_PREFIXES)
+
+
+def main() -> None:
+    failures: list[str] = []
+    for relative in tracked_and_untracked():
+        full = ROOT / relative
+        if not full.exists() and not full.is_symlink():
+            continue
+
+        path = Path(relative)
+        parts = set(path.parts)
+        name = path.name
+
+        if parts & GENERATED_PARTS or name in GENERATED_NAMES or name.startswith("._"):
+            failures.append(f"generated artifact is tracked: {relative}")
+        if name.endswith((".pyc", ".pyo")):
+            failures.append(f"compiled Python artifact is tracked: {relative}")
+
+        if not is_history(relative) and MILESTONE_PATH.search(relative):
+            failures.append(f"milestone-oriented current path: {relative}")
+        if OBSOLETE_SURFACE.search(relative):
+            failures.append(f"obsolete compatibility surface: {relative}")
+
+        if not full.is_file() or full.is_symlink():
+            continue
+        if relative == "tests/scripts/check-repository-hygiene":
+            continue
+        try:
+            text = full.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+
+        if not is_history(relative) and MILESTONE_TEXT.search(text):
+            failures.append(f"milestone text remains in current file: {relative}")
+        if not is_history(relative) and OBSOLETE_SURFACE.search(text):
+            failures.append(f"obsolete milestone command referenced by: {relative}")
+        if not is_history(relative):
+            for referenced in SCRIPT_REFERENCE.findall(text):
+                normalized = referenced[2:] if referenced.startswith("./") else referenced
+                target = ROOT / normalized
+                if not target.is_file():
+                    failures.append(f"missing script reference in {relative}: {normalized}")
+
+
+    for directory in (ROOT / "scripts", ROOT / "tests" / "scripts"):
+        for path in directory.iterdir():
+            if path.is_file() and path.read_bytes().startswith(b"#!") and not os.access(path, os.X_OK):
+                failures.append(f"script is not executable: {path.relative_to(ROOT)}")
+
+    if failures:
+        print("Repository hygiene check failed:")
+        for failure in sorted(set(failures)):
+            print(f"- {failure}")
+        raise SystemExit(1)
+
+    print("OK: repository paths, fixtures, prompts, and generated artifacts are neutral and clean")
+
+
+if __name__ == "__main__":
+    main()

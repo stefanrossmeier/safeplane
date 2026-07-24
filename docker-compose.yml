@@ -1,0 +1,196 @@
+services:
+  harness:
+    build: ./services/harness
+    user: "10001:10001"
+    environment:
+      SAFEPLANE_HOME: /data/safeplane
+      SAFEPLANE_CONFIG: /app/safeplane.yaml
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/sessions:/data/safeplane/sessions
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/runs:/data/safeplane/runs
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/traces:/data/safeplane/traces
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/workspaces:/data/safeplane/workspaces
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/logs/mcp:/data/safeplane/logs/mcp
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/config:/data/safeplane/config:ro
+      - ./safeplane.yaml:/app/safeplane.yaml:ro
+      - ./workflows:/app/workflows:ro
+      - ./prompts:/app/prompts:ro
+    depends_on:
+      model-gateway:
+        condition: service_healthy
+      calendar-task-mcp:
+        condition: service_healthy
+      notification-task-mcp:
+        condition: service_healthy
+      scheduler:
+        condition: service_healthy
+    networks:
+      - harness-egress
+      - harness-model
+      - harness-tools
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 256
+    cpus: "1.50"
+    mem_limit: 1024m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  model-gateway:
+    build: ./services/model-gateway
+    user: "10001:10001"
+    environment:
+      SAFEPLANE_HOME: /data/safeplane
+      WORKFLOW_CONTRACT_ROOT: /app/workflows
+      MODEL_GATEWAY_MODE: ${MODEL_GATEWAY_MODE:-fake}
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/traces:/data/safeplane/traces
+      - ./workflows:/app/workflows:ro
+      - ./prompts:/app/prompts:ro
+    networks:
+      - model-egress
+      - harness-model
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 128
+    cpus: "1.00"
+    mem_limit: 512m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  calendar-task-mcp:
+    build:
+      context: .
+      dockerfile: mcp-servers/calendar-task/Dockerfile
+    user: "10001:10001"
+    environment:
+      SAFEPLANE_HOME: /data/safeplane
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/data/calendar:/data/safeplane/data/calendar
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/logs/mcp:/data/safeplane/logs/mcp
+    networks:
+      - harness-tools
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 64
+    cpus: "0.50"
+    mem_limit: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: services/scheduler/Dockerfile
+    image: safeplane-scheduler:latest
+    user: "10001:10001"
+    environment:
+      SAFEPLANE_HOME: /data/safeplane
+      SAFEPLANE_NOTIFICATION_CONNECTORS: ${SAFEPLANE_NOTIFICATION_CONNECTORS:-log}
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/data/notifications:/data/safeplane/data/notifications
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/data/calendar:/data/safeplane/data/calendar:ro
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/logs/scheduler:/data/safeplane/logs/scheduler
+    networks:
+      - notification-delivery
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 64
+    cpus: "0.50"
+    mem_limit: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  notification-task-mcp:
+    build:
+      context: .
+      dockerfile: mcp-servers/notification-task/Dockerfile
+    image: safeplane-notification-task-mcp:latest
+    user: "10001:10001"
+    environment:
+      SAFEPLANE_HOME: /data/safeplane
+      SAFEPLANE_SCHEDULER_URL: http://scheduler:8080
+    volumes:
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/data/notifications:/data/safeplane/data/notifications
+      - ${SAFEPLANE_HOME:-${HOME}/.safeplane}/logs/mcp:/data/safeplane/logs/mcp
+    depends_on:
+      scheduler:
+        condition: service_healthy
+    networks:
+      - harness-tools
+      - notification-delivery
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 64
+    cpus: "0.50"
+    mem_limit: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+networks:
+  harness-egress:
+  model-egress:
+  telegram-egress:
+  harness-model:
+    internal: true
+  harness-tools:
+    internal: true
+  notification-delivery:
+    internal: true
+  connector-harness:
+    internal: true

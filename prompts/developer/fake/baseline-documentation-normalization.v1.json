@@ -1,0 +1,13 @@
+{
+  "stage": "baseline",
+  "summary": "Created a minimal documentation baseline from a model response whose safely derivable diff metadata required deterministic normalization.",
+  "documentation_files": [
+    "docs/REPO_MAP.md"
+  ],
+  "changed": true,
+  "unified_diff": "diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md\nnew file mode 100644\n--- /dev/null\n+++ b/docs/ARCHITECTURE.md\n@@ -0,0 +1,7 @@\n+# Architecture\n+\n+> Generated with `ai-craftkit` skill: `archdoc`\n+> Source: `ai-craftkit` at commit `${ARCHDOC_COMMIT}`\n+> Skill bundle SHA-256: `${ARCHDOC_SKILL_SHA256}`\n+> Prompt: `${DOCUMENTATION_PROMPT}`\n+> Repository profile: `${REPOSITORY_PROFILE}`\n+\n+Doc Status: DRAFT\n+Source Basis: repository files supplied through Safeplane MCP tools and the external archdoc skill\n",
+  "evidence_notes": [
+    "The acceptance fixture intentionally declares an incorrect hunk count and mismatched documentation_files entry."
+  ],
+  "uncertainties": []
+}

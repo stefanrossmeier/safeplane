@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+HARNESS_SRC = REPO_ROOT / "services/harness/src"
+sys.path.insert(0, str(HARNESS_SRC))
+
+from harness.evals import default_safeplane_home, run_assistant_calendar_eval, run_assistant_calendar_eval_batch  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Safeplane eval runner")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    assistant_calendar = subparsers.add_parser(
+        "assistant-calendar-tools",
+        help="Evaluate assistant calendar tool-call reliability",
+    )
+    assistant_calendar.add_argument(
+        "--harness-url",
+        default="http://127.0.0.1:8787",
+        help="Harness URL. Default: http://127.0.0.1:8787",
+    )
+    assistant_calendar.add_argument(
+        "--safeplane-home",
+        default=str(default_safeplane_home()),
+        help="SAFEPLANE_HOME path",
+    )
+    assistant_calendar.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=120,
+        help="Timeout per eval case",
+    )
+    assistant_calendar.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of eval suite runs. Default: 1",
+    )
+    assistant_calendar.add_argument(
+        "--between-run-delay-seconds",
+        type=float,
+        default=20.0,
+        help="Delay between repeated suite runs. Default: 20.0",
+    )
+    assistant_calendar.add_argument(
+        "--case-delay-seconds",
+        type=float,
+        default=8.0,
+        help="Delay between eval cases. Default: 8.0",
+    )
+    assistant_calendar.add_argument(
+        "--provider-retry-count",
+        type=int,
+        default=3,
+        help="Retries for provider/rate-limit failures. Default: 3",
+    )
+    assistant_calendar.add_argument(
+        "--provider-retry-base-sleep-seconds",
+        type=float,
+        default=20.0,
+        help="Base sleep for provider retries. Default: 20.0",
+    )
+    assistant_calendar.add_argument(
+        "--provider-retry-max-sleep-seconds",
+        type=float,
+        default=90.0,
+        help="Max sleep for provider retries. Default: 90.0",
+    )
+    assistant_calendar.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON summary only",
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "assistant-calendar-tools":
+        if args.runs > 1:
+            jsonl_path, summary_path, results, summary = run_assistant_calendar_eval_batch(
+                safeplane_home=Path(args.safeplane_home).expanduser(),
+                harness_url=args.harness_url,
+                runs=args.runs,
+                timeout_seconds=args.timeout_seconds,
+                case_delay_seconds=args.case_delay_seconds,
+                between_run_delay_seconds=args.between_run_delay_seconds,
+                provider_retry_count=args.provider_retry_count,
+                provider_retry_base_sleep_seconds=args.provider_retry_base_sleep_seconds,
+                provider_retry_max_sleep_seconds=args.provider_retry_max_sleep_seconds,
+            )
+
+            if args.json:
+                print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+                return 0 if summary["failed_cases"] == 0 else 1
+
+            print("Safeplane assistant calendar tool eval batch")
+            print(f"batch_id: {summary['batch_id']}")
+            print(f"runs: {summary['passed_runs']}/{summary['total_runs']}")
+            print(f"run_pass_rate: {summary['run_pass_rate']:.2f}")
+            print(f"cases: {summary['passed_cases']}/{summary['total_cases']}")
+            print(f"case_pass_rate: {summary['case_pass_rate']:.2f}")
+            print(f"total_invalid_proposals: {summary['total_invalid_proposals']}")
+            print(f"max_invalid_proposals: {summary['max_invalid_proposals']}")
+            print(f"max_latency_ms: {summary['max_latency_ms']}")
+            print(f"configured_models: {', '.join(summary['configured_models']) or '-'}")
+            print(f"actual_models: {', '.join(summary['actual_models']) or '-'}")
+            print(f"actual_providers: {', '.join(summary['actual_providers']) or '-'}")
+            router_profile = summary.get("router_profile") or {}
+            if router_profile:
+                print(f"router_actual_model_count: {router_profile.get('actual_model_count')}")
+                print(f"router_actual_provider_count: {router_profile.get('actual_provider_count')}")
+                if router_profile.get("note"):
+                    print(f"router_note: {router_profile['note']}")
+            if summary.get("error_categories"):
+                print(f"error_categories: {summary['error_categories']}")
+            print(f"case_delay_seconds: {summary.get('case_delay_seconds')}")
+            print(f"between_run_delay_seconds: {summary.get('between_run_delay_seconds')}")
+            print(f"provider_retry_count: {summary.get('provider_retry_count')}")
+            print(f"jsonl: {jsonl_path}")
+            print(f"summary: {summary_path}")
+            print()
+
+            for case_id, case_summary in summary["per_case"].items():
+                print(
+                    f"{case_id}: "
+                    f"{case_summary['passed']}/{case_summary['total']} "
+                    f"pass_rate={case_summary['pass_rate']:.2f} "
+                    f"max_invalid_proposals={case_summary['max_invalid_proposals']}"
+                )
+
+            return 0 if summary["failed_cases"] == 0 else 1
+
+        jsonl_path, summary_path, results, summary = run_assistant_calendar_eval(
+            safeplane_home=Path(args.safeplane_home).expanduser(),
+            harness_url=args.harness_url,
+            timeout_seconds=args.timeout_seconds,
+            case_delay_seconds=args.case_delay_seconds,
+            provider_retry_count=args.provider_retry_count,
+            provider_retry_base_sleep_seconds=args.provider_retry_base_sleep_seconds,
+            provider_retry_max_sleep_seconds=args.provider_retry_max_sleep_seconds,
+        )
+
+        if args.json:
+            print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0 if summary["failed"] == 0 else 1
+
+        print("Safeplane assistant calendar tool eval")
+        print(f"eval_run_id: {summary['eval_run_id']}")
+        print(f"passed: {summary['passed']}/{summary['total']}")
+        print(f"pass_rate: {summary['pass_rate']:.2f}")
+        print(f"total_invalid_proposals: {summary['total_invalid_proposals']}")
+        print(f"max_invalid_proposals: {summary['max_invalid_proposals']}")
+        print(f"max_latency_ms: {summary['max_latency_ms']}")
+        print(f"configured_models: {', '.join(summary['configured_models']) or '-'}")
+        print(f"actual_models: {', '.join(summary['actual_models']) or '-'}")
+        print(f"actual_providers: {', '.join(summary['actual_providers']) or '-'}")
+        if summary.get("error_categories"):
+            print(f"error_categories: {summary['error_categories']}")
+        print(f"case_delay_seconds: {summary.get('case_delay_seconds')}")
+        print(f"provider_retry_count: {summary.get('provider_retry_count')}")
+        print(f"jsonl: {jsonl_path}")
+        print(f"summary: {summary_path}")
+        print()
+
+        for result in results:
+            status = "PASS" if result.passed else "FAIL"
+            tools = ", ".join(result.observed_tool_names) or "-"
+            print(
+                f"{status} {result.case_id} "
+                f"expected={result.expected_tool_name or '-'} "
+                f"observed={tools} "
+                f"invalid_proposals={result.proposal_invalid_count} "
+                f"latency_ms={result.latency_ms}"
+            )
+
+            if result.error:
+                print(f"  error: {result.error}")
+
+        return 0 if summary["failed"] == 0 else 1
+
+    parser.error(f"unknown command: {args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

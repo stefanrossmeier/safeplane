@@ -1,0 +1,14 @@
+{
+  "type": "final",
+  "implementation_summary_markdown": "# Implementation Summary\n\nThe first final response intentionally uses stale source text.",
+  "replacements": [
+    {
+      "path": "src/greeter.py",
+      "old_text": "    return f\"Hello from stale context, {name}!\"",
+      "new_text": "    return f\"Hello from the developer pipeline, {name}!\""
+    }
+  ],
+  "changed_files": [
+    "src/greeter.py"
+  ]
+}

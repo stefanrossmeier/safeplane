@@ -1,0 +1,40 @@
+version: 1
+bundle_id: developer.pipeline.prompts
+bundle_version: v1
+source_notes:
+  conitera:
+    source_artifact: app.zip
+    purpose: Prompt and stage examples adapted into Safeplane workflow contracts.
+    copied_verbatim: false
+  archdoc:
+    external_repository: https://github.com/stefanrossmeier/ai-craftkit.git
+    path: skills/archdoc
+    copied_into_safeplane: false
+    repository_prepared_at_runtime: repository workspace preparation
+    documentation_agent_consumes_at_runtime: external documentation workflow implemented
+    runtime_content_persisted_in_prompt_bundle: false
+prompts:
+  documentation:
+    id: developer.documentation.system
+    version: v3
+    path: prompts/developer/documentation.system.v3.md
+  analysis:
+    id: developer.analysis.system
+    version: v1
+    path: prompts/developer/analysis.system.v1.md
+  planning:
+    id: developer.planning.system
+    version: v7
+    path: prompts/developer/planning.system.v7.md
+  implementation:
+    id: developer.implementation.system
+    version: v7
+    path: prompts/developer/implementation.system.v7.md
+  review:
+    id: developer.review.system
+    version: v2
+    path: prompts/developer/review.system.v2.md
+  pr:
+    id: developer.pr.system
+    version: v1
+    path: prompts/developer/pr.system.v1.md
