@@ -88,7 +88,7 @@ The checkout must be clean. Update records the previous revision before a
 fast-forward pull and healthy restart:
 
 ```bash
-./scripts/safeplane-vps update --branch main
+./scripts/safeplane-vps update --branch mvp-27
 ```
 
 Rollback resets to the recorded previous commit and requires an explicit guard:

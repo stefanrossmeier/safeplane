@@ -16,9 +16,13 @@ Core services are part of the Safeplane execution runtime.
 ## Connectors
 
     connectors/
+      common/
+      cli/
       telegram/
 
-Connectors are transport adapters. They should stay dumb.
+Connectors are transport adapters. `common` holds the shared typed harness
+client, `cli` is the one-shot operator connector, and `telegram` is the
+long-running Telegram transport. Connectors should stay dumb.
 
 A connector should:
 
@@ -76,7 +80,7 @@ Prompts are workflow-owned text artifacts loaded by the harness at runtime.
 
 ## Removed legacy workflow services
 
-Earlier iterations used separate workflow services.
+Earlier MVPs used separate workflow services.
 
 Those services were removed after the harness-owned runtime became the only active execution path.
 

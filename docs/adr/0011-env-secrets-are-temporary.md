@@ -6,13 +6,13 @@ Accepted
 
 ## Context
 
-Phase 0 needs a pragmatic way to provide local provider credentials for manual real-model smoke tests.
+MVP 0 needs a pragmatic way to provide local provider credentials for manual real-model smoke tests.
 
 Plaintext secrets are acceptable only as a temporary local development mechanism.
 
 ## Decision
 
-For phase 0, `.env` is used for local secrets and runtime mode.
+For MVP 0, `.env` is used for local secrets and runtime mode.
 
 The `.env` file is gitignored.
 
@@ -22,5 +22,5 @@ The harness and chat workflow containers must not receive provider API keys.
 
 ## Consequences
 
-This is simple enough for phase 0, but not the final secret-management design. Later, `.env` should be replaced by a secret provider without changing harness or workflow code.
+This is simple enough for MVP 0, but not the final secret-management design. Later, `.env` should be replaced by a secret provider without changing harness or workflow code.
 

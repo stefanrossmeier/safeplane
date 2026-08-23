@@ -36,9 +36,9 @@ The default retry budget is:
 
 This means an initial attempt plus five repair attempts.
 
-Phase 9 implements the retry primitive.
+MVP 9 implements the retry primitive.
 
-Phase 10 will use it in the assistant tool-call loop.
+MVP 10 will use it in the assistant tool-call loop.
 
 MCP access is logged under:
 
@@ -50,7 +50,7 @@ MCP server execution logs live under:
 
 These are normal Safeplane logs and serve as the audit trail.
 
-MCP Roots are not used as a required safety boundary in phase 9.
+MCP Roots are not used as a required safety boundary in MVP 9.
 
 Safeplane uses its own path/root enforcement.
 
@@ -71,6 +71,6 @@ Invalid tool output is detected before being returned to a workflow.
 
 The calendar MCP service proves the broker boundary without enabling assistant calendar behavior yet.
 
-Assistant calendar usage moves to phase 10.
+Assistant calendar usage moves to MVP 10.
 
 Future developer workspace MCP tools can reuse the same broker, schema, logging, retry, and path enforcement foundations.

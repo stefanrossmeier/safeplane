@@ -11,10 +11,11 @@
   deterministic workflows · isolated runs · validated changes · human approval
 ```
 
-Safeplane is a local-first control plane for bounded AI-agent workflows. Thin
-CLI and Telegram connectors translate operator intent, while a deterministic
-harness owns workflow order, run state, permissions, credentials, validation,
-repository changes, Git operations, evidence, and remote-write policy.
+Safeplane is a local-first control plane for bounded AI-agent workflows. An
+explicit one-shot CLI connector and the long-running Telegram connector translate
+operator intent, while a deterministic harness owns workflow order, run state,
+permissions, credentials, validation, repository changes, Git operations,
+evidence, and remote-write policy.
 
 **Status:** Safeplane is deployed and running on both a MacBook and a VPS,
 including assistant and developer workflows. Public-facing documentation is
@@ -23,11 +24,14 @@ operational evidence are continuing to improve.
 
 ```mermaid
 flowchart LR
-    O[Operator] --> C[CLI or Telegram]
+    O[Operator] --> L[scripts/safeplane]
+    L --> C[one-shot CLI connector]
+    TA[Telegram API] --> TG[Telegram connector]
     C --> H[Harness]
+    TG --> H
     H --> M[Model gateway]
     M --> P[Model provider]
-    H --> T[Authorized MCP tools]
+    H --> MCP[Authorized MCP tools]
     H --> W[Isolated run workspaces]
     H --> V[Validation and review]
     V --> G[Harness-owned Git and draft PR]
@@ -38,8 +42,10 @@ Planned and deferred work is tracked in [Backlog](docs/BACKLOG.md).
 
 ## Architecture highlights
 
-- **Thin connectors, explicit workflows.** CLI and Telegram select registry-backed
-  entrypoints; connectors do not decide stage order, permissions, or policy.
+- **Explicit thin connectors, explicit workflows.** Networked CLI commands run in
+  a one-shot connector container and Telegram runs in its own connector service.
+  Both select registry-backed entrypoints; connectors do not decide stage order,
+  permissions, or policy.
 - **Harness-owned authority.** The harness owns run and session lifecycle,
   retries, terminal states, MCP authorization, authoritative writes, checks,
   credentials, Git operations, draft-PR creation, evidence, and cleanup.
@@ -80,9 +86,12 @@ make up
 ./scripts/safeplane workflows
 ```
 
-The harness is published only on `127.0.0.1:8787`. Runtime state is stored under
-`${SAFEPLANE_HOME:-$HOME/.safeplane}` and credentials are stored separately
-under `${SAFEPLANE_SECRET_ROOT:-$HOME/.config/safeplane/secrets}`.
+The local overlay publishes the harness only on `127.0.0.1:8787` for direct
+development diagnostics. `./scripts/safeplane` does not use that host port: it
+runs each networked command in `cli-connector`, which reaches the harness only
+over the internal `connector-harness` network. Runtime state is stored under
+`${SAFEPLANE_HOME:-$HOME/.safeplane}` and credentials are stored separately under
+`${SAFEPLANE_SECRET_ROOT:-$HOME/.config/safeplane/secrets}`.
 
 Stop the stack:
 
@@ -129,8 +138,8 @@ local evidence.
 
 | Mode | Model access | Connector or remote access | Secrets | Host exposure |
 | --- | --- | --- | --- | --- |
-| Fake local | fake model gateway | CLI | none | harness on loopback only |
-| Local real provider | OpenRouter through model-gateway | CLI | OpenRouter file secret in model-gateway only | harness on loopback only |
+| Fake local | fake model gateway | one-shot CLI connector | none | optional harness loopback diagnostic |
+| Local real provider | OpenRouter through model-gateway | one-shot CLI connector | OpenRouter file secret in model-gateway only | optional harness loopback diagnostic |
 | Telegram fake | fake model gateway | real Telegram long polling | Telegram file secrets in telegram-connector only | no application port required |
 | Telegram real | OpenRouter plus Telegram | real Telegram long polling | provider and Telegram secrets remain service-scoped | no application port required |
 | GitHub publication | fake or real model | Git and GitHub from the harness | GitHub file secret in harness only | no additional application port |
@@ -165,6 +174,7 @@ commands.
 - [Container interactions and security boundaries](docs/security/runtime-boundaries.md)
 - [Developer workflow and artifact flow](docs/developer-pipeline.md)
 - [Local secrets](docs/security/secrets.md)
+- [CLI connector](docs/connectors/cli.md)
 - [Telegram connector](docs/connectors/telegram.md)
 - [Repository profiles and workspaces](docs/repository-workspaces.md)
 - [Remote write and draft-PR policy](docs/remote-write.md)

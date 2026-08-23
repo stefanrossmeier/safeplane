@@ -8,10 +8,13 @@ import subprocess
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_cli_develop_repo_option_is_documented_and_payload_aware() -> None:
-    script = (REPO_ROOT / "scripts/safeplane-chat").read_text(encoding="utf-8")
-    assert "develop [--repo <profile>]" in script
-    assert "repository_profile" in script
+def test_cli_develop_repo_option_is_implemented_by_explicit_connector() -> None:
+    cli = (REPO_ROOT / "connectors/cli/src/safeplane_cli/main.py").read_text(encoding="utf-8")
+    legacy = (REPO_ROOT / "scripts/safeplane-chat").read_text(encoding="utf-8")
+    assert 'parser.add_argument("--repo", dest="repository_profile")' in cli
+    assert "repository_profile=repository_profile" in cli
+    assert "curl" not in legacy
+    assert "SAFEPLANE_HARNESS_URL" not in legacy
     completed = subprocess.run(
         ["bash", "-n", str(REPO_ROOT / "scripts/safeplane-chat")],
         check=False,

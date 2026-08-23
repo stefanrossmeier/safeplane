@@ -112,9 +112,9 @@ def move_if_present(source: str, destination: str) -> None:
 
 
 def archive_legacy_planning() -> None:
-    # The live planning document now lives at docs/BACKLOG.md.
-    # Only superseded planning copies under the legacy docs/mvp tree are archived.
-    move_if_present("docs/mvp/mvp-ladder.md", "docs/history/legacy-roadmap.md")
+    # The root mvp-ladder.md is the single live operator roadmap.
+    # Only superseded planning copies under docs/mvp are archived.
+    move_if_present("docs/mvp/mvp-ladder.md", "docs/history/legacy-mvp-ladder.md")
     move_if_present("docs/mvp/cleanup-tasks.md", "docs/history/legacy-cleanup-tasks.md")
     legacy_dir = ROOT / "docs" / "mvp"
     if legacy_dir.exists() and not any(legacy_dir.iterdir()):

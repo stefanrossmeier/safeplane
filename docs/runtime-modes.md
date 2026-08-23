@@ -4,16 +4,23 @@ Safeplane mode selection is explicit in the Compose wrapper. Fake mode is the
 default for development and automated acceptance; every real external path is a
 guarded operator action.
 
-| Mode | Wrapper | Model | External systems | Host port |
+| Mode | Wrapper | Model | Connector / external access | Host port |
 | --- | --- | --- | --- | --- |
-| fake local | `tests/scripts/compose-safeplane-fake` | fake | none | harness on loopback |
-| real provider local | `tests/scripts/compose-safeplane-real` | OpenRouter | OpenRouter | harness on loopback |
+| fake local | `tests/scripts/compose-safeplane-fake` | fake | one-shot CLI connector | harness loopback diagnostic |
+| real provider local | `tests/scripts/compose-safeplane-real` | OpenRouter | one-shot CLI connector plus OpenRouter | harness loopback diagnostic |
 | Telegram fake | `tests/scripts/compose-safeplane-telegram-fake` | fake | Telegram | none |
 | Telegram real | `tests/scripts/compose-safeplane-telegram-real` | OpenRouter | OpenRouter and Telegram | none |
 | developer fake | `tests/scripts/compose-safeplane-developer-fake` | fake | local or configured Git sources | harness on loopback |
 | developer real | `tests/scripts/compose-safeplane-developer-real` | OpenRouter | OpenRouter and configured Git sources | harness on loopback |
 | developer GitHub fake | `tests/scripts/compose-safeplane-developer-github-fake` | fake | GitHub | harness on loopback |
 | developer GitHub real | `tests/scripts/compose-safeplane-developer-github-real` | OpenRouter | OpenRouter and GitHub | harness on loopback |
+
+
+The CLI connector is defined in the base Compose file with the `cli` profile. It
+is not a long-running service: `./scripts/safeplane` uses `docker compose run
+--rm --no-deps -T cli-connector ...`, and the connector reaches only the harness
+over `connector-harness`. Local loopback publication exists for diagnostics and
+legacy direct HTTP tests, not for normal CLI transport.
 
 ## Fake local
 

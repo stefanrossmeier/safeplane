@@ -28,6 +28,7 @@ services:
       - harness-egress
       - harness-model
       - harness-tools
+      - connector-harness
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -46,6 +47,31 @@ services:
       timeout: 3s
       retries: 20
       start_period: 10s
+
+  cli-connector:
+    build:
+      context: .
+      dockerfile: connectors/cli/Dockerfile
+    image: safeplane-cli-connector:latest
+    user: "10001:10001"
+    environment:
+      SAFEPLANE_HARNESS_URL: http://harness:8080
+    networks:
+      - connector-harness
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 32
+    cpus: "0.50"
+    mem_limit: 128m
+    restart: "no"
+    profiles:
+      - cli
 
   model-gateway:
     build: ./services/model-gateway

@@ -3,6 +3,6 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-export PYTHONPATH="services/harness/src:mcp-servers/calendar-task/src:mcp-servers/notification-task/src:mcp-servers/dev-workspace/src:services/scheduler/src:${PYTHONPATH:-}"
+export PYTHONPATH="services/harness/src:mcp-servers/calendar-task/src:mcp-servers/notification-task/src:mcp-servers/dev-workspace/src:services/scheduler/src:connectors/common/src:connectors/cli/src:${PYTHONPATH:-}"
 
 pytest tests/unit "$@"

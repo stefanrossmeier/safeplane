@@ -119,4 +119,4 @@ deliberately sanitized publication artifact from eligible runs.
 The protected `backups` directory is an interface boundary, not proof of a full
 runtime backup and restore implementation. Calendar reset creates a local
 calendar backup. A complete runtime manifest, restore procedure, update and
-rollback workflow, and recovery drill remain operational hardening work.
+rollback workflow, and recovery drill remain future deployment work.

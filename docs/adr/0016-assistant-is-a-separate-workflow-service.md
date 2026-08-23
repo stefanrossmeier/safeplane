@@ -1,6 +1,6 @@
 # ADR 0016: Assistant is a separate workflow service
 
-> Superseded note: this ADR describes the phase 4 service-based workflow design.
+> Superseded note: this ADR describes the MVP 4 service-based workflow design.
 > It was superseded by the harness-owned agent runtime introduced later.
 > Current workflow definitions are contracts; chat, assistant, and slow execute through the harness runtime.
 
@@ -11,7 +11,7 @@ Accepted
 
 ## Context
 
-Phase 4 introduced the assistant workflow as the second workflow after chat.
+MVP 4 introduced the assistant workflow as the second workflow after chat.
 
 Although the assistant initially behaves similarly to chat, it is expected to diverge later.
 
@@ -44,7 +44,7 @@ Chat sessions cannot be continued with assistant, and assistant sessions cannot 
 
 ## Consequences
 
-There is some duplication in early phases.
+There is some duplication in early MVPs.
 
 The separation keeps future evolution clean.
 

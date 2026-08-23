@@ -257,13 +257,15 @@ def test_developer_workflow_validation_is_executable_and_proves_single_pass_stop
 
 
 def test_cli_status_exposes_single_pass_pipeline_evidence() -> None:
-    script = (REPO_ROOT / "scripts/safeplane-chat").read_text(encoding="utf-8")
-    assert "pipeline state:" in script
-    assert "completed stages:" in script
-    assert "checks:" in script
-    assert "review:" in script
-    assert "remote approval:" in script
-    assert "models:" in script
+    rendering = (
+        REPO_ROOT / "connectors/cli/src/safeplane_cli/rendering.py"
+    ).read_text(encoding="utf-8")
+    assert "pipeline state:" in rendering
+    assert "completed stages:" in rendering
+    assert "checks:" in rendering
+    assert "review:" in rendering
+    assert "remote approval:" in rendering
+    assert "models:" in rendering
 
 
 def test_draft_pr_validation_is_executable_and_proves_remote_write_boundaries() -> None:
@@ -300,14 +302,17 @@ def test_draft_pr_validation_is_executable_and_proves_remote_write_boundaries() 
 
 
 def test_cli_exposes_remote_approval_and_draft_pr_status() -> None:
-    script = (REPO_ROOT / "scripts/safeplane-chat").read_text(encoding="utf-8")
-    assert "safeplane approve-pr <run-id>" in script
-    assert "/remote/approve" in script
-    assert '"connector":"cli"' in script
-    assert "planned branch:" in script
-    assert "approved workspace:" in script
-    assert "remote branch:" in script
-    assert "draft PR:" in script
+    launcher = (REPO_ROOT / "scripts/safeplane").read_text(encoding="utf-8")
+    cli = (REPO_ROOT / "connectors/cli/src/safeplane_cli/main.py").read_text(encoding="utf-8")
+    client = (REPO_ROOT / "connectors/common/src/safeplane_connector/client.py").read_text(encoding="utf-8")
+    rendering = (REPO_ROOT / "connectors/cli/src/safeplane_cli/rendering.py").read_text(encoding="utf-8")
+    assert "safeplane approve-pr <run-id>" in launcher
+    assert "/remote/approve" in client
+    assert 'connector_name="cli"' in cli
+    assert "planned branch:" in rendering
+    assert "approved workspace:" in rendering
+    assert "remote branch:" in rendering
+    assert "draft PR:" in rendering
 
 
 def test_real_draft_pr_github_draft_pr_smoke_is_guarded_and_dedicated() -> None:
@@ -416,7 +421,7 @@ def test_real_external_repository_acceptance_is_guarded_and_two_step() -> None:
 
 def test_safeplane_routes_case_study_command() -> None:
     script = (REPO_ROOT / "scripts/safeplane").read_text(encoding="utf-8")
-    assert '"${1:-}" = "case-study"' in script
+    assert "case-study)" in script
     assert 'exec "$SCRIPT_DIR/safeplane-case-study" "$@"' in script
 
 
@@ -446,8 +451,8 @@ def test_status_script_reports_developer_model_profile_overrides() -> None:
 def test_safeplane_help_and_evidence_commands_are_operator_facing() -> None:
     script = (REPO_ROOT / "scripts/safeplane").read_text(encoding="utf-8")
     docs = (REPO_ROOT / "docs/scripts.md").read_text(encoding="utf-8")
-    assert '"${1:-}" = "help"' in script
-    assert '"${1:-}" = "evidence"' in script
+    assert "help|--help|-h)" in script
+    assert "evidence)" in script
     assert "safeplane evidence [latest|run-id]" in script
     assert "accept-publication-path" in docs
 

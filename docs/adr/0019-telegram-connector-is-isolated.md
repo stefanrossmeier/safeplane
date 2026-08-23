@@ -7,7 +7,7 @@ Accepted
 
 ## Context
 
-Phase 7 introduces Telegram as the first external connector.
+MVP 7 introduces Telegram as the first external connector.
 
 Telegram long polling can hold an HTTP request open for many seconds.
 
@@ -53,7 +53,7 @@ The allowed user ids are stored as a Docker secret:
 
 If no user ids are configured, all Telegram users are rejected.
 
-Phase 7 uses long polling.
+MVP 7 uses long polling.
 
 Webhook mode is deferred.
 
@@ -71,4 +71,4 @@ Safeplane keeps a clean boundary:
 
 Future connectors can follow the same pattern.
 
-Future outbound notifications can reuse Telegram later, but phase 7 only replies to inbound messages.
+Future outbound notifications can reuse Telegram later, but MVP 7 only replies to inbound messages.

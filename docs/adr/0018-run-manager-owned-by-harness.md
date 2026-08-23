@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Phase 6 introduced explicit run lifecycle tracking.
+MVP 6 introduced explicit run lifecycle tracking.
 
 Before this, Safeplane tracked sessions and turns, but not individual execution attempts.
 
@@ -34,7 +34,7 @@ Every connector request creates a run.
 
 Workflow execution is asynchronous internally by default.
 
-The CLI still waits for its own run to complete and prints the result. There is no --no-wait flag in phase 6.
+The CLI still waits for its own run to complete and prints the result. There is no --no-wait flag in MVP 6.
 
 Run records are persisted under:
 
@@ -42,7 +42,7 @@ Run records are persisted under:
 
 Run status belongs to the run, not to the session.
 
-Phase 6 uses these statuses:
+MVP 6 uses these statuses:
 
     queued
     running
@@ -80,7 +80,7 @@ Trace paths remain session/turn based:
 
 The run id is added as metadata to trace events and output artifacts.
 
-Phase 6 adds a model-free slow workflow for concurrency testing.
+MVP 6 adds a model-free slow workflow for concurrency testing.
 
 The slow workflow exists to prove that one long-running run does not block another session.
 
@@ -100,4 +100,4 @@ Future connector notifications can report completion of a specific run.
 
 The CLI remains simple.
 
-Cancellation and crash recovery remain out of scope for phase 6.
+Cancellation and crash recovery remain out of scope for MVP 6.

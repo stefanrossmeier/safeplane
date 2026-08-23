@@ -74,6 +74,7 @@ def test_base_services_use_narrow_runtime_mounts() -> None:
             "/data/safeplane/data/calendar",
             "/data/safeplane/logs/scheduler",
         },
+        "cli-connector": set(),
     }
     for name, targets in expected.items():
         mounted = volume_targets(compose["services"][name])
@@ -141,6 +142,11 @@ def test_long_running_services_have_container_hardening() -> None:
         assert_hardened(base[name])
         assert "healthcheck" in base[name]
 
+    assert_hardened(base["cli-connector"])
+    assert base["cli-connector"]["restart"] == "no"
+    assert base["cli-connector"]["profiles"] == ["cli"]
+    assert "healthcheck" not in base["cli-connector"]
+
     assert_hardened(load("docker-compose.telegram.yml")["services"]["telegram-connector"])
     assert_hardened(load("docker-compose.github-mock.yml")["services"]["github-mock"])
 
@@ -170,6 +176,7 @@ def test_all_service_images_set_a_non_root_user() -> None:
         "mcp-servers/calendar-task/Dockerfile",
         "mcp-servers/notification-task/Dockerfile",
         "connectors/telegram/Dockerfile",
+        "connectors/cli/Dockerfile",
         "mcp-servers/dev-workspace/Dockerfile",
         "tests/fixtures/github-mock/Dockerfile",
     )
@@ -195,6 +202,7 @@ def test_networks_are_explicit_and_internal_where_required() -> None:
         "harness-egress",
         "harness-model",
         "harness-tools",
+        "connector-harness",
     }
     assert set(services["model-gateway"]["networks"]) == {
         "model-egress",
@@ -206,6 +214,10 @@ def test_networks_are_explicit_and_internal_where_required() -> None:
         "notification-delivery",
     }
     assert services["scheduler"]["networks"] == ["notification-delivery"]
+    assert services["cli-connector"]["networks"] == ["connector-harness"]
+    assert not volume_targets(services["cli-connector"])
+    assert "secrets" not in services["cli-connector"]
+    assert "ports" not in services["cli-connector"]
 
     telegram = load("docker-compose.telegram.yml")["services"]
     assert set(telegram["telegram-connector"]["networks"]) == {

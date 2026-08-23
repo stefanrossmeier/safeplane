@@ -19,7 +19,9 @@ SAFEPLANE_SECRET_ROOT=$HOME/.config/safeplane/secrets
 
 ```mermaid
 flowchart LR
-    CLI[CLI] -->|loopback HTTP| H[Harness]
+    OP[Operator] --> L[scripts/safeplane]
+    L --> CLI[one-shot CLI connector]
+    CLI -->|connector-harness| H[Harness]
     TG[Telegram connector] -->|connector-harness| H
     H -->|harness-model| MG[Model gateway]
     MG -->|model-egress| OR[OpenRouter]
@@ -40,7 +42,8 @@ flowchart LR
 
 | Service | Calls or receives calls | Networks | Writable mounts | Read-only mounts | Secret mounts | External egress | Host ports |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `harness` | receives CLI/Telegram requests; calls model gateway, MCP services, Git, and GitHub | `harness-egress`, `harness-model`, `harness-tools`; optional `connector-harness`, `dev-workspace-internal`, `github-mock-internal` | `sessions`, `runs`, `traces`, `workspaces`, `logs/mcp`; test-only `publication-remotes` volume | `config`, `safeplane.yaml`, `workflows`, `prompts`; optional developer source and local Git fixtures | `github_token` only in GitHub mode | Git and GitHub | `127.0.0.1:8787` only with local overlay; `127.0.0.1:18787` in test overlay |
+| `harness` | receives CLI/Telegram requests; calls model gateway, MCP services, Git, and GitHub | `harness-egress`, `harness-model`, `harness-tools`, `connector-harness`; optional `dev-workspace-internal`, `github-mock-internal` | `sessions`, `runs`, `traces`, `workspaces`, `logs/mcp`; test-only `publication-remotes` volume | `config`, `safeplane.yaml`, `workflows`, `prompts`; optional developer source and local Git fixtures | `github_token` only in GitHub mode | Git and GitHub | `127.0.0.1:8787` only with local overlay; `127.0.0.1:18787` in test overlay |
+| `cli-connector` | receives one operator command; calls harness | `connector-harness` | none | none | none | none | none |
 | `model-gateway` | receives model requests from harness; calls provider in real mode | `harness-model`, `model-egress` | `traces` | `workflows`, `prompts` | `openrouter_api_key` only in real mode | OpenRouter in real mode | none |
 | `calendar-task-mcp` | receives harness-brokered calendar calls | `harness-tools` | `data/calendar`, `logs/mcp` | none | none | none | none |
 | `notification-task-mcp` | receives harness-brokered notification calls; requests scheduler reload/delivery work | `harness-tools`, `notification-delivery` | `data/notifications`, `logs/mcp` | none | none | none | none |
@@ -68,6 +71,8 @@ publishing an unbound workspace.
 Long-running services use UID/GID `10001:10001`, read-only root filesystems,
 `no-new-privileges`, dropped Linux capabilities, bounded tmpfs, CPU, memory and
 PID limits, health checks, and health-conditioned dependencies where required.
+The one-shot CLI connector uses the same process hardening but has `restart: no`
+and no health check because it is not a daemon.
 
 The secret directory is mode `0700`. Secret files are mode `0644` inside that
 private directory so the fixed non-root container UID can read only the single
@@ -87,6 +92,7 @@ Rendered and running-container boundaries:
 
 ```bash
 tests/scripts/accept-runtime-hardening
+tests/scripts/accept-cli-connector
 ```
 
 Runtime mode and health inspection:

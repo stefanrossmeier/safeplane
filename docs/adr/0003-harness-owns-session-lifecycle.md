@@ -12,9 +12,9 @@ Session lifecycle must be consistent across connectors and workflows.
 
 The harness owns session creation and session persistence.
 
-For phase 0, every incoming connector message creates a new session.
+For MVP 0, every incoming connector message creates a new session.
 
-Session continuation is explicitly out of scope for phase 0.
+Session continuation is explicitly out of scope for MVP 0.
 
 ## Consequences
 

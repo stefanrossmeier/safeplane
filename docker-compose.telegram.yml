@@ -1,11 +1,4 @@
 services:
-  harness:
-    networks:
-      - harness-egress
-      - harness-model
-      - harness-tools
-      - connector-harness
-
   telegram-connector:
     build: ./connectors/telegram
     user: "10001:10001"

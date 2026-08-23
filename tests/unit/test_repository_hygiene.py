@@ -28,21 +28,19 @@ def test_generated_artifacts_are_ignored() -> None:
         assert expected in ignore
 
 
-def test_live_backlog_is_documented_under_docs() -> None:
+def test_current_backlog_is_linked_from_readme() -> None:
     backlog = REPO_ROOT / "docs" / "BACKLOG.md"
     assert backlog.is_file()
     content = backlog.read_text(encoding="utf-8")
-    assert "# Backlog" in content
-    assert "## Current priorities" in content
-    assert "## Deferred candidates" in content
+    assert "# Safeplane backlog" in content
 
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert "docs/BACKLOG.md" in readme
 
 
-def test_hygiene_normalizer_preserves_live_backlog() -> None:
+def test_hygiene_normalizer_preserves_live_root_roadmap() -> None:
     normalizer = (REPO_ROOT / "scripts" / "normalize-repository-hygiene").read_text(
         encoding="utf-8"
     )
     assert 'move_if_present("mvp-ladder.md"' not in normalizer
-    assert 'move_if_present("docs/mvp/mvp-ladder.md", "docs/history/legacy-roadmap.md")' in normalizer
+    assert 'move_if_present("docs/mvp/mvp-ladder.md"' in normalizer

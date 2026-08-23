@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-After phase 4, Safeplane had more than one workflow.
+After MVP 4, Safeplane had more than one workflow.
 
 The system needed a structured way to list and resolve workflows without introducing probabilistic routing too early.
 
@@ -14,7 +14,7 @@ Routing is still intentionally deferred.
 
 ## Decision
 
-Phase 5 adds a deterministic workflow registry owned by the harness.
+MVP 5 adds a deterministic workflow registry owned by the harness.
 
 Resolution flow:
 
@@ -49,7 +49,7 @@ The CLI also supports explicit generic execution:
 
     safeplane run <entrypoint> "message"
 
-There is no LLM router, fuzzy matching, or advisor in phase 5.
+There is no LLM router, fuzzy matching, or advisor in MVP 5.
 
 ## Consequences
 

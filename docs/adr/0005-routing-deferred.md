@@ -8,11 +8,11 @@ Accepted
 
 Routing only becomes useful when more than one workflow exists.
 
-Phase 0 has exactly one workflow: `chat`.
+MVP 0 has exactly one workflow: `chat`.
 
 ## Decision
 
-Do not implement routing in phase 0.
+Do not implement routing in MVP 0.
 
 Instead, use a static entrypoint binding:
 

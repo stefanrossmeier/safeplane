@@ -14,6 +14,30 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def prepare_acceptance_runtime_layout(runtime_root: Path) -> None:
+    # Docker must not auto-create these bind sources as root: the runtime
+    # containers deliberately run as UID/GID 10001 and need writable state.
+    runtime_root.chmod(0o700)
+    writable = (
+        "sessions",
+        "runs",
+        "traces",
+        "workspaces",
+        "data/calendar",
+        "data/notifications",
+        "logs/mcp",
+        "logs/scheduler",
+    )
+    for relative in writable:
+        path = runtime_root / relative
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o777)
+
+    config = runtime_root / "config"
+    config.mkdir(parents=True, exist_ok=True)
+    config.chmod(0o755)
+
+
 def run_command(
     args: list[str],
     *,
@@ -43,6 +67,7 @@ def run_command(
 
 
 def compose_env(safeplane_home: Path) -> dict[str, str]:
+    prepare_acceptance_runtime_layout(safeplane_home)
     env = os.environ.copy()
     env["COMPOSE_PROJECT_NAME"] = "safeplane_acceptance"
     env["SAFEPLANE_HOME"] = str(safeplane_home)

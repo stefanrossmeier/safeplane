@@ -19,7 +19,7 @@ Safeplane classifies runtime data into:
 - protected durable data
 - maintenance state
 
-Phase 2 introduces local maintenance commands:
+MVP 2 introduces local maintenance commands:
 
     ./scripts/safeplane maintenance storage
     ./scripts/safeplane maintenance clean --dry-run --older-than 30d
@@ -28,7 +28,7 @@ Phase 2 introduces local maintenance commands:
 
 Safe cleanup deletes old trace directories only.
 
-Sessions are not deleted by safe cleanup in phase 2.
+Sessions are not deleted by safe cleanup in MVP 2.
 
 Protected durable directories are never deleted by cleanup:
 
@@ -59,15 +59,15 @@ Positive:
 
 Tradeoffs:
 
-- Phase 2 does not implement automatic scheduled cleanup.
-- Phase 2 does not delete sessions through safe cleanup.
+- MVP 2 does not implement automatic scheduled cleanup.
+- MVP 2 does not delete sessions through safe cleanup.
 - `clean-all` is intentionally destructive for runtime state and must be used carefully.
 
 ## Rejected alternatives
 
 ### Delete sessions together with old traces
 
-Rejected for phase 2 because session continuation comes next and session lifecycle rules are not mature yet.
+Rejected for MVP 2 because session continuation comes next and session lifecycle rules are not mature yet.
 
 ### Allow arbitrary cleanup paths
 

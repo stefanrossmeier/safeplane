@@ -8,9 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HISTORY_PREFIXES = ("docs/adr/", "docs/history/")
-LIVE_ROADMAP = "docs/BACKLOG.md"
+LIVE_ROADMAP = "mvp-ladder.md"
 GENERATED_PARTS = {"__pycache__", "__MACOSX"}
 GENERATED_NAMES = {".DS_Store"}
+TARGET_TERMS = re.compile(r"(?i)\b(?:dailydash|silver)\b")
 MILESTONE_TEXT = re.compile(r"(?i)\bmvp(?:\s*\d|\d)")
 MILESTONE_PATH = re.compile(r"(?i)(?:^|[./_-])mvp(?:\d|[./_-])")
 SCRIPT_REFERENCE = re.compile(r"(?<![A-Za-z0-9_.-])(tests/scripts/[A-Za-z0-9._-]+|\./scripts/[A-Za-z0-9._-]+)")
@@ -63,6 +64,8 @@ def main() -> None:
 
         if not is_history(relative) and MILESTONE_TEXT.search(text):
             failures.append(f"milestone text remains in current file: {relative}")
+        if not is_history(relative) and TARGET_TERMS.search(text):
+            failures.append(f"target-specific fixture text remains: {relative}")
         if not is_history(relative) and OBSOLETE_SURFACE.search(text):
             failures.append(f"obsolete milestone command referenced by: {relative}")
         if not is_history(relative):

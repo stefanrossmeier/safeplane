@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+exec pytest \
+  "$ROOT/tests/unit/test_compose_yaml_integrity.py" \
+  "$ROOT/tests/unit/test_runtime_security_boundaries.py" \
+  "$@"

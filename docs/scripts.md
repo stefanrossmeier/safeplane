@@ -10,7 +10,7 @@ Requirements:
 
 - Docker Engine and Docker Compose plugin
 - Python 3.11+
-- `make`, `git`, and `curl`
+- `make`, `git`, and `curl` (curl is used by local stack health helpers, not by the CLI connector)
 
 Install local test dependencies and prepare the split runtime layout:
 
@@ -52,7 +52,9 @@ tests/scripts/compose-safeplane-fake down
 ```
 
 Fake mode uses the fake model gateway and requires no provider secret. The local
-overlay publishes the harness only on `127.0.0.1:8787`.
+overlay publishes the harness only on `127.0.0.1:8787` for direct diagnostics.
+Networked `./scripts/safeplane` commands run in the one-shot `cli-connector` and
+reach the harness through `connector-harness`, not through that host port.
 
 ## Real-provider local mode
 
@@ -131,6 +133,11 @@ explicit registry entrypoint; it is not an LLM router. See
 [Telegram connector](connectors/telegram.md).
 
 ## CLI workflows and sessions
+
+`scripts/safeplane` is a host launcher. Networked commands execute one process in
+the isolated `cli-connector` container; the launcher contains no harness endpoint
+or request construction logic. The image is built by `make up` and is built on
+first use if it is absent.
 
 ```bash
 ./scripts/safeplane workflows
@@ -276,7 +283,7 @@ remote approval remain protected.
 ## Backup and restore interface
 
 There is no complete runtime backup-and-restore package yet. That is part of the
-remaining operational hardening work and must not be inferred from the presence of a
+future deployment work and must not be inferred from the presence of a
 `backups` directory.
 
 Current safety interfaces are limited to:

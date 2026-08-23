@@ -5,7 +5,7 @@ Status: accepted
 
 ## Context
 
-Phase 0 used temporary environment-variable based secret handling.
+MVP 0 used temporary environment-variable based secret handling.
 
 Safeplane will accumulate more secrets over time, including provider keys, connector tokens, calendar storage keys, and GitHub tokens.
 
@@ -17,7 +17,7 @@ Safeplane uses local secret files under `SAFEPLANE_HOME/secrets` as the source o
 
 For Docker Compose real-mode provider access, Safeplane uses Compose secrets backed by those files.
 
-For phase 1, the implemented secret is:
+For MVP 1, the implemented secret is:
 
     ~/.safeplane/secrets/openrouter_api_key
 
@@ -69,4 +69,4 @@ Rejected because this breaks service-specific secret boundaries.
 
 ### Add Vault or cloud KMS now
 
-Rejected because it is too heavy for the current local-first design.
+Rejected because it is too heavy for the current local-first MVP.

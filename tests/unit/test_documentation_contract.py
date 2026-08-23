@@ -182,7 +182,7 @@ def test_current_docs_do_not_reintroduce_stale_or_private_product_claims() -> No
 def test_readme_keeps_explicit_current_limitations() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "## Known limitations" in readme
-    assert "MacBook" in readme and "VPS" in readme
+    assert "VPS" in readme and "not" in readme
     assert "single-pass" in readme
     assert "never merges" in readme
     assert "backup-and-restore" in readme

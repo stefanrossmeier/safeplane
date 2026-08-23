@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export PYTHONPATH="$ROOT/connectors/common/src:$ROOT/connectors/cli/src${PYTHONPATH:+:$PYTHONPATH}"
+exec pytest "$ROOT/tests/unit/test_cli_connector.py" "$ROOT/tests/unit/test_cli_launcher.py" "$@"

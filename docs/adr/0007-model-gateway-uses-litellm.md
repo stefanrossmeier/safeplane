@@ -12,7 +12,7 @@ Safeplane should support model access through a small gateway rather than direct
 
 The model gateway uses LiteLLM for real model calls.
 
-For phase 0, the intended real provider path is OpenRouter through LiteLLM.
+For MVP 0, the intended real provider path is OpenRouter through LiteLLM.
 
 Normal tests use fake mode and do not call real models.
 

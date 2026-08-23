@@ -3,7 +3,7 @@
 	accept-developer-workspace accept-patch-approval accept-developer-contract \
 	accept-repository-workspaces accept-developer-tools accept-external-documentation \
 	accept-developer-workflow accept-draft-pr-workflow accept-publication-path \
-	accept-telegram-workflows accept-repository-cleanup accept-runtime-hardening accept-documentation check-repository-hygiene normalize-repository-hygiene prepare-runtime-layout wait smoke-real clean-data \
+	accept-telegram-workflows accept-repository-cleanup accept-runtime-hardening accept-cli-connector accept-documentation check-repository-hygiene normalize-repository-hygiene prepare-runtime-layout wait smoke-real clean-data \
 	secret-set secret-set-openrouter secret-set-github secrets-list storage \
 	clean-artifacts-dry-run clean-artifacts clean-all
 
@@ -18,6 +18,7 @@ build:
 
 up:
 	./scripts/prepare-runtime-layout
+	docker compose -f docker-compose.yml -f docker-compose.local.yml build cli-connector
 	docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build model-gateway calendar-task-mcp harness
 	@echo "Waiting for harness..."
 	@for i in $$(seq 1 30); do \
@@ -101,6 +102,9 @@ accept-repository-cleanup:
 accept-runtime-hardening:
 	tests/scripts/accept-runtime-hardening
 
+accept-cli-connector:
+	tests/scripts/accept-cli-connector
+
 accept-documentation:
 	tests/scripts/accept-documentation
 
@@ -141,9 +145,10 @@ smoke-real:
 		echo "Run: make secret-set-openrouter"; \
 		exit 1; \
 	fi
+	docker compose -f docker-compose.yml -f docker-compose.local.yml -f docker-compose.real.yml build cli-connector
 	docker compose -f docker-compose.yml -f docker-compose.local.yml -f docker-compose.real.yml up -d --build --force-recreate model-gateway calendar-task-mcp harness
 	$(MAKE) wait
-	SAFEPLANE_HARNESS_URL=http://127.0.0.1:8787 ./scripts/safeplane chat "$(MESSAGE)"
+	./scripts/safeplane chat "$(MESSAGE)"
 
 storage:
 	./scripts/safeplane maintenance storage

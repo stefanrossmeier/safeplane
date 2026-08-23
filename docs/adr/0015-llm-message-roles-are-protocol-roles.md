@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Phase 3 introduced persisted multi-turn message artifacts.
+MVP 3 introduced persisted multi-turn message artifacts.
 
 The artifact contains messages with roles such as:
 

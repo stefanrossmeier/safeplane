@@ -2,15 +2,25 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [ "${1:-}" = "help" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  cat <<'EOF'
+usage() {
+  cat <<'USAGE'
 Safeplane operator commands
 
+Connector commands (run in the one-shot CLI connector container):
+  safeplane workflows                       List workflow entrypoints
+  safeplane runs                            List runs
   safeplane chat <message>                  Send a chat message
+  safeplane assistant <message>             Run the assistant workflow
+  safeplane developer <message>             Run the developer tool entrypoint
   safeplane develop --repo <id> <task>      Start a developer workflow
-  safeplane status [run-id]                 Inspect a run
+  safeplane run <entrypoint> <message>       Run an explicit entrypoint
+  safeplane status <run-id>                 Inspect a run
+  safeplane approve-patch <run> <proposal>  Approve a patch proposal
   safeplane approve-pr <run-id>             Retry/manual draft-PR creation
+
+Local operator utilities:
   safeplane evidence [latest|run-id]        Collect run evidence into one directory
   safeplane case-study <run-id> ...         Generate sanitized public evidence
   safeplane maintenance storage             Show runtime disk usage
@@ -18,29 +28,59 @@ Safeplane operator commands
   safeplane maintenance clean               Delete old inactive traces/workspaces
   safeplane calendar --help                 Calendar commands
 
+Connector commands accept --output json for machine-readable output.
 See docs/scripts.md for the full task-oriented guide.
-EOF
-  exit 0
+USAGE
+}
+
+case "${1:-}" in
+  help|--help|-h)
+    usage
+    exit 0
+    ;;
+  maintenance)
+    shift
+    exec "$SCRIPT_DIR/safeplane-maintenance" "$@"
+    ;;
+  calendar)
+    shift
+    exec "$SCRIPT_DIR/safeplane-calendar" "$@"
+    ;;
+  case-study)
+    shift
+    exec "$SCRIPT_DIR/safeplane-case-study" "$@"
+    ;;
+  evidence)
+    shift
+    exec "$SCRIPT_DIR/safeplane-evidence" "$@"
+    ;;
+  "")
+    usage >&2
+    exit 2
+    ;;
+esac
+
+# This host-side script owns no harness URL, request payload, or response logic.
+# It launches one command in the isolated CLI connector on the connector-harness network.
+COMPOSE=(
+  docker compose
+  --project-directory "$REPO_ROOT"
+  -f "$REPO_ROOT/docker-compose.yml"
+)
+
+# Compose progress is launcher noise, not CLI output. Keep successful connector
+# commands clean while preserving stdout/stderr emitted by the connector itself.
+export COMPOSE_PROGRESS=quiet
+
+CLI_IMAGE="safeplane-cli-connector:latest"
+if ! docker image inspect "$CLI_IMAGE" >/dev/null 2>&1; then
+  build_log="$(mktemp "${TMPDIR:-/tmp}/safeplane-cli-build.XXXXXX")"
+  if ! "${COMPOSE[@]}" build cli-connector >"$build_log" 2>&1; then
+    cat "$build_log" >&2
+    rm -f "$build_log"
+    exit 1
+  fi
+  rm -f "$build_log"
 fi
 
-if [ "${1:-}" = "maintenance" ]; then
-  shift
-  exec "$SCRIPT_DIR/safeplane-maintenance" "$@"
-fi
-
-if [ "${1:-}" = "calendar" ]; then
-  shift
-  exec "$SCRIPT_DIR/safeplane-calendar" "$@"
-fi
-
-if [ "${1:-}" = "case-study" ]; then
-  shift
-  exec "$SCRIPT_DIR/safeplane-case-study" "$@"
-fi
-
-if [ "${1:-}" = "evidence" ]; then
-  shift
-  exec "$SCRIPT_DIR/safeplane-evidence" "$@"
-fi
-
-exec "$SCRIPT_DIR/safeplane-chat" "$@"
+exec "${COMPOSE[@]}" run --rm --no-deps -T cli-connector "$@"

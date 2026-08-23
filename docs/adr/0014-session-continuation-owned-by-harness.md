@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Phase 3 added continuation of existing chat sessions.
+MVP 3 added continuation of existing chat sessions.
 
 A user can start a session and later continue it by passing either the short display id or the full sess_<uuid> id.
 

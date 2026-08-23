@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+RUNTIME_ROOT="$(mktemp -d)"
+PROJECT="safeplane_cli_acceptance_$$"
+export SAFEPLANE_HOME="$RUNTIME_ROOT"
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export MODEL_GATEWAY_MODE=fake
+
+COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.test.yml)
+
+cleanup() {
+  "${COMPOSE[@]}" down --remove-orphans --volumes >/dev/null 2>&1 || true
+  rm -rf "$RUNTIME_ROOT"
+}
+trap cleanup EXIT
+
+./scripts/prepare-runtime-layout >/dev/null
+"${COMPOSE[@]}" build cli-connector
+"${COMPOSE[@]}" up -d --build model-gateway calendar-task-mcp scheduler notification-task-mcp harness
+
+python3 - <<'PY'
+import time
+import urllib.request
+
+deadline = time.monotonic() + 90
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:18787/health", timeout=2) as response:
+            if response.status == 200:
+                break
+    except Exception:
+        time.sleep(1)
+else:
+    raise SystemExit("harness did not become healthy")
+PY
+
+"${COMPOSE[@]}" run --rm --no-deps -T cli-connector workflows >/dev/null
+chat_output="$("${COMPOSE[@]}" run --rm --no-deps -T cli-connector chat 'connector boundary check')"
+grep -Fq '[fake chat] connector boundary check' <<<"$chat_output"
+
+json_output="$("${COMPOSE[@]}" run --rm --no-deps -T cli-connector workflows --output json)"
+python3 - "$json_output" <<'PY'
+import json
+import sys
+payload = json.loads(sys.argv[1])
+assert isinstance(payload["workflows"], list)
+PY
+
+"${COMPOSE[@]}" run --rm --no-deps -T --entrypoint python cli-connector - <<'PY'
+import os
+from pathlib import Path
+import socket
+import urllib.request
+
+assert os.getuid() == 10001
+assert os.getgid() == 10001
+assert not Path("/var/run/docker.sock").exists()
+assert not Path("/run/secrets").exists()
+assert not Path("/data/safeplane").exists()
+
+status = {}
+for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+    if ":" in line:
+        key, value = line.split(":", 1)
+        status[key] = value.strip()
+assert status.get("CapEff") == "0000000000000000", status.get("CapEff")
+assert status.get("NoNewPrivs") == "1", status.get("NoNewPrivs")
+
+root_options = None
+for line in Path("/proc/mounts").read_text(encoding="utf-8").splitlines():
+    fields = line.split()
+    if len(fields) >= 4 and fields[1] == "/":
+        root_options = set(fields[3].split(","))
+        break
+assert root_options is not None and "ro" in root_options, root_options
+
+try:
+    Path("/rootfs-write-probe").write_text("no", encoding="utf-8")
+except OSError:
+    pass
+else:
+    raise SystemExit("CLI connector root filesystem is writable")
+
+Path("/tmp/cli-write-probe").write_text("ok", encoding="utf-8")
+with urllib.request.urlopen("http://harness:8080/health", timeout=5) as response:
+    assert response.status == 200
+
+for forbidden in ("model-gateway", "calendar-task-mcp", "notification-task-mcp"):
+    try:
+        socket.getaddrinfo(forbidden, 8080)
+    except socket.gaierror:
+        continue
+    raise SystemExit(f"CLI connector can unexpectedly resolve {forbidden}")
+PY
+
+echo "CLI connector runs one-shot on connector-harness with no runtime mounts, secrets, Docker socket, model network, or MCP network"

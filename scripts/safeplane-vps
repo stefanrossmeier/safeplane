@@ -286,6 +286,9 @@ def config(_: argparse.Namespace) -> None:
 
 def start(args: argparse.Namespace) -> None:
     profile = active_profile()
+    # The CLI is a one-shot profiled service, so normal `up` does not start it.
+    # Build it explicitly during every deployment reconciliation.
+    compose("build", "cli-connector")
     previous = recorded_profile()
     if previous and previous != profile:
         print(f"Switching VPS profile: {previous} -> {profile}")
@@ -557,7 +560,7 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--confirm", required=True)
     item.set_defaults(func=restore)
     item = sub.add_parser("update")
-    item.add_argument("--branch", default="main")
+    item.add_argument("--branch", default="mvp-27")
     item.add_argument("--timeout", type=int, default=300)
     item.set_defaults(func=update)
     item = sub.add_parser("rollback")
