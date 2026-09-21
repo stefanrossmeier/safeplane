@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+reports/.checkpoint.jsonl
+reports/.checkpoint.meta.json
+reports/**/.checkpoint.jsonl
+reports/**/.checkpoint.meta.json

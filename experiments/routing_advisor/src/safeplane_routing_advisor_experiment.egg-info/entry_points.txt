@@ -1,0 +1,2 @@
+[console_scripts]
+safeplane-routing-advisor = safeplane_routing_advisor.cli:main

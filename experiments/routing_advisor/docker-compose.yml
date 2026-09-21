@@ -1,0 +1,21 @@
+services:
+  routing-advisor:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      ROUTING_ADVISOR_DATA_DIR: /app/data
+    volumes:
+      # Safeplane itself is input-only for this experiment.
+      - ../..:/repo:ro
+      # Reports are the only host path written by the container.
+      - ./reports:/app/reports
+    command:
+      - run
+      - --repo-root
+      - /repo
+      - --version
+      - v2
+      - --output-dir
+      - /app/reports/v2

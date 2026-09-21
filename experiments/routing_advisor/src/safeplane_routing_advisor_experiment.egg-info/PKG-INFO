@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: safeplane-routing-advisor-experiment
+Version: 0.2.0
+Summary: Isolated Jev routing-advisor experiment for Safeplane workflows
+Requires-Python: >=3.11
+Requires-Dist: httpx<1,>=0.28
+Requires-Dist: pydantic<3,>=2.10
+Requires-Dist: PyYAML<7,>=6.0
+Provides-Extra: dev
+Requires-Dist: pytest<10,>=8; extra == "dev"
