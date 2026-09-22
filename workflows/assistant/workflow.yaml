@@ -7,6 +7,20 @@ supported_entrypoints:
 examples:
 - Help me plan today
 - Draft a short checklist for this task
+routing:
+  summary: >-
+    Personal-assistant work concerning the operator's schedule, reminders, calendar, or
+    personal planning. A missing event identifier, reminder name, or exact time may
+    require clarification before execution but does not make the route itself unclear.
+  positive_signals:
+  - List, create, move, or cancel calendar entries.
+  - Schedule, list, or cancel reminders and notifications.
+  - Plan or organize the operator's time, commitments, or personal follow-up.
+  - Personal preparation/checklist work tied to the operator's own upcoming activity.
+  negative_signals:
+  - Pure general Q&A, generic drafting, or generic coding with no personal productivity intent.
+  - Repository inspection, implementation, tests, patches, Git work, or repository documentation changes.
+  - Choosing assistant merely because an abstract example contains words such as schedule or reminder.
 prompt:
   id: assistant.system
   version: v1

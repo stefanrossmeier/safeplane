@@ -45,6 +45,8 @@ class WorkflowRegistryEntry:
     mcp: dict[str, Any]
     agents: dict[str, Any]
     developer_pipeline: dict[str, Any]
+    deterministic_tools: dict[str, Any]
+    routing: dict[str, Any]
     operator_facing: bool
     connectors: dict[str, dict[str, Any]]
 
@@ -136,6 +138,30 @@ def validate_contract(
             raise WorkflowContractValidationError(
                 f"Workflow contract {contract_path} must define {policy_field} as a mapping"
             )
+
+    routing = contract.get("routing")
+    if routing is not None:
+        if not isinstance(routing, dict):
+            raise WorkflowContractValidationError(
+                f"Workflow contract {contract_path} routing metadata must be a mapping"
+            )
+        for field in ("summary", "positive_signals", "negative_signals"):
+            if field not in routing:
+                raise WorkflowContractValidationError(
+                    f"Workflow contract {contract_path} routing metadata is missing {field}"
+                )
+        if not str(routing.get("summary") or "").strip():
+            raise WorkflowContractValidationError(
+                f"Workflow contract {contract_path} routing.summary must not be empty"
+            )
+        for field in ("positive_signals", "negative_signals"):
+            values = routing.get(field)
+            if not isinstance(values, list) or not values or not all(
+                isinstance(item, str) and item.strip() for item in values
+            ):
+                raise WorkflowContractValidationError(
+                    f"Workflow contract {contract_path} routing.{field} must be a non-empty list of strings"
+                )
 
     if contract.get("developer_pipeline") is not None:
         try:
@@ -342,6 +368,8 @@ def build_registry(config: dict[str, Any], config_path: Path) -> dict[str, Workf
             mcp=dict(contract["mcp"]),
             agents=dict(contract.get("agents", {})),
             developer_pipeline=dict(contract.get("developer_pipeline", {})),
+            deterministic_tools=dict(contract.get("deterministic_tools", {})),
+            routing=dict(contract.get("routing", {})),
             operator_facing=bool(entrypoint.get("operator_facing", True)),
             connectors=connector_definitions,
         )
@@ -370,6 +398,8 @@ def registry_entry_to_public_dict(entry: WorkflowRegistryEntry) -> dict[str, Any
         "mcp": entry.mcp,
         "agents": entry.agents,
         "developer_pipeline": entry.developer_pipeline,
+        "deterministic_tools": entry.deterministic_tools,
+        "routing": entry.routing,
         "operator_facing": entry.operator_facing,
         "connectors": entry.connectors,
     }

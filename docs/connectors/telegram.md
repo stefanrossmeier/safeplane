@@ -1,7 +1,9 @@
 # Telegram Connector Setup
 
 The optional Telegram connector runs in its own Docker container and exposes
-workflow-registry-backed commands. It does not use an LLM to choose a workflow.
+workflow-registry-backed commands. In the default configuration, the first plain
+text message after `/new` asks the harness routing advisor to choose a workflow;
+slash commands remain deterministic.
 
 The Telegram connector runs in its own Docker container.
 
@@ -13,7 +15,8 @@ It is not part of the default `make up` stack.
 
 The connector is intentionally dumb.
 
-It does not own sessions, runs, routing, model calls, tools, or workflow logic.
+It does not own sessions, runs, routing policy, model calls, tools, or workflow
+logic. Automatic routing is performed by the harness through the model gateway.
 
 It translates:
 
@@ -230,8 +233,7 @@ Meaning:
 
     /assistant <message>
       Start or continue the assistant workflow, including its allowed calendar
-      and notification MCP tools. Plain text maps to this configured default
-      workflow unless the operator changes the connector configuration.
+      and notification MCP tools. This is always an explicit deterministic route.
 
     /develop <repository-profile> <task>
       Start the complete fixed developer workflow asynchronously. The connector
@@ -250,6 +252,24 @@ Meaning:
       the run id is omitted, use the latest run mapped to the Telegram chat. The
       harness pushes the deterministic branch and creates or reuses one draft PR.
       Safeplane does not merge it.
+
+
+## Plain-text automatic routing
+
+With `connectors.telegram.routing_mode: automatic`, a plain-text message after
+`/new` is sent to the harness `auto` entrypoint. The harness asks Jev through the
+model gateway, applies the fixed routing policy, and resolves only an enabled,
+Telegram-exposed registry entrypoint. The connector never interprets model output.
+
+After a route is accepted, later plain-text messages remain bound to that workflow
+session until `/new`. This preserves workflow/session continuity and prevents each
+follow-up from being reclassified without conversation context. Use `/new` to ask
+the advisor to route the next plain-text message again, or use `/chat`, `/assistant`,
+or `/develop` at any time for deterministic routing.
+
+If the advisor abstains, the provider is unavailable, or a selected developer task
+lacks repository context, Safeplane does not silently choose a more capable route.
+The operator must use an explicit command or supply the missing repository profile.
 
 ## Session mapping
 

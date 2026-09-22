@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0031](0031-advisory-natural-language-routing.md)
 
 ## Context
 
@@ -20,5 +20,5 @@ Instead, use a static entrypoint binding:
 
 ## Consequences
 
-This avoids fake architecture. Deterministic routing can be added when there is more than one workflow. Any future LLM-based routing advisor must run outside the deterministic harness core and use the model gateway for model access.
+This avoided fake architecture while Safeplane had only one workflow. The later workflow registry established deterministic resolution, and ADR 0031 now adds advisory natural-language routing without changing the authority boundary: explicit dispatch remains deterministic and model access remains behind the model gateway.
 

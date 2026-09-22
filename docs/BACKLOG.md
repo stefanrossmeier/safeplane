@@ -27,7 +27,7 @@ behavior belongs in current architecture and operations documentation instead.
 
 ## Product candidates
 
-Candidates such as bounded developer rework, deterministic routing advice,
+Candidates such as bounded developer rework, multi-workflow composition,
 persistent notes, a web operator interface, additional connectors, external
 calendar synchronization, broader GitHub integration, end-to-end cancellation,
 browser automation, multi-user operation, and orchestration scaling require a

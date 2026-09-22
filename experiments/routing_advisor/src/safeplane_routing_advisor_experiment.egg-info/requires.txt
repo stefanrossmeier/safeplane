@@ -1,6 +1,0 @@
-httpx<1,>=0.28
-pydantic<3,>=2.10
-PyYAML<7,>=6.0
-
-[dev]
-pytest<10,>=8

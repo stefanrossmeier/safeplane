@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -29,6 +32,22 @@ class ChatRequest(BaseModel):
     turn: int = Field(ge=1)
     timeout_seconds: int = Field(default=30, ge=1, le=3600)
 
+
+
+
+class DecisionRequest(BaseModel):
+    model: str = "typesafe/jev-1.13"
+    state: dict[str, Any]
+    questions: dict[str, Any]
+    timeout_seconds: int = Field(default=30, ge=1, le=300)
+
+
+class DecisionResponse(BaseModel):
+    id: str | None = None
+    model: str
+    provider: str | None = None
+    answers: dict[str, Any]
+    usage: dict[str, Any] | None = None
 
 class GatewayModelInfo(BaseModel):
     mode: str
@@ -475,6 +494,132 @@ def real_completion(
     )
 
     return chat_response, raw_artifact, metadata
+
+
+
+
+def fake_decision(request: DecisionRequest) -> DecisionResponse:
+    text = str(request.state.get("request") or "").lower()
+    supplied_context = request.state.get("supplied_context")
+    if not isinstance(supplied_context, dict):
+        supplied_context = {}
+    repository_profile = str(supplied_context.get("repository_profile") or "").strip()
+
+    assistant_terms = (
+        "remind", "reminder", "calendar", "meeting", "appointment", "notify",
+        "notification", "schedule", "reschedule", "cancel my", "plan my day",
+    )
+    developer_terms = (
+        "repository", "repo", "codebase", "patch", "pull request", "commit",
+        "git ", "test failure", "failing test", "fix the bug", "implement in",
+        "change the code", "update the code", "inspect the code",
+    )
+    assistant = any(term in text for term in assistant_terms)
+    developer = any(term in text for term in developer_terms)
+    multiple = assistant and developer
+    identifiable = bool(text.strip())
+    route = "developer" if developer else "assistant" if assistant else "chat"
+    probabilities = {"chat": 0.005, "assistant": 0.005, "developer": 0.005}
+    probabilities[route] = 0.99
+    if not identifiable:
+        probabilities = {"chat": 0.34, "assistant": 0.33, "developer": 0.33}
+
+    return DecisionResponse(
+        id="fake-routing-decision",
+        model=request.model,
+        provider="safeplane-fake",
+        answers={
+            "route": {
+                "choice": route,
+                "confidence": probabilities[route],
+                "probabilities": probabilities,
+            },
+            "route_identifiable": {"noul": 0.99 if identifiable else 0.01},
+            "needs_clarification_before_execution": {"noul": 0.05},
+            "requires_multiple_workflows": {"noul": 0.99 if multiple else 0.01},
+            "repository_work": {"noul": 0.99 if developer else 0.01},
+            "missing_repository_profile": {
+                "noul": 0.99 if developer and not repository_profile else 0.01
+            },
+            "assistant_tool_need": {"noul": 0.99 if assistant else 0.01},
+        },
+        usage={
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost_usd": 0.0,
+        },
+    )
+
+
+def real_decision(request: DecisionRequest) -> DecisionResponse:
+    api_key = openrouter_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "OpenRouter API key is required for real routing decisions. "
+            "Expected /run/secrets/openrouter_api_key or OPENROUTER_API_KEY."
+        )
+
+    url = os.environ.get(
+        "OPENROUTER_DECISIONS_URL",
+        "https://openrouter.ai/api/alpha/decisions",
+    )
+    payload = {
+        "model": request.model,
+        "state": request.state,
+        "questions": request.questions,
+    }
+    encoded = json.dumps(payload).encode("utf-8")
+    last_error: Exception | None = None
+    retryable = {429, 500, 502, 503, 524, 529}
+
+    for attempt in range(4):
+        http_request = urllib.request.Request(
+            url,
+            data=encoded,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/stefanrossmeier/safeplane",
+                "X-Title": "Safeplane routing advisor",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                http_request,
+                timeout=request.timeout_seconds,
+            ) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            if not isinstance(data, dict):
+                raise RuntimeError("OpenRouter decision response must be an object")
+            return DecisionResponse.model_validate(data)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(
+                f"OpenRouter decisions HTTP {exc.code}: {body}"
+            )
+            if exc.code not in retryable or attempt == 3:
+                break
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+            if attempt == 3:
+                break
+        time.sleep(0.5 * (2**attempt))
+
+    raise RuntimeError(f"OpenRouter decision request failed after retries: {last_error}")
+
+
+@app.post("/decisions", response_model=DecisionResponse)
+def decisions(request: DecisionRequest) -> DecisionResponse:
+    try:
+        mode = os.environ.get("MODEL_GATEWAY_MODE", "fake").lower()
+        if mode == "fake":
+            return fake_decision(request)
+        if mode == "real":
+            return real_decision(request)
+        raise RuntimeError(f"Unsupported MODEL_GATEWAY_MODE: {mode}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/health")

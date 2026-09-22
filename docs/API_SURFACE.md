@@ -16,8 +16,8 @@ paths during the shell-to-container migration.
 | --- | --- | --- |
 | `GET` | `/workflows` | List registry-backed workflows; optional connector filters are supported |
 | `GET` | `/workflows/{entrypoint}` | Read one workflow definition |
-| `POST` | `/connector/{entrypoint}` | Start a workflow and wait for its terminal response |
-| `POST` | `/connector/{entrypoint}/start` | Start a workflow asynchronously |
+| `POST` | `/connector/{entrypoint}` | Start a workflow and wait for its terminal response; `entrypoint=auto` invokes advisory routing |
+| `POST` | `/connector/{entrypoint}/start` | Start a workflow asynchronously; `entrypoint=auto` routes before normal execution |
 
 Current connector message requests contain:
 
@@ -31,7 +31,16 @@ Current connector message requests contain:
 ```
 
 `session_ref` and `repository_profile` are omitted when unused. The
-`repository_profile` value is valid only for the `develop` entrypoint in the CLI.
+`repository_profile` value is valid for the explicit `develop` entrypoint and for
+`auto`, where it is supplied as bounded routing context. A successful connector
+response also reports the resolved `workflow_id` and `entrypoint`; automatic runs
+include a `routing` evidence object.
+
+`auto` is a synthetic harness ingress, not a workflow registry entry. Jev is called
+through the model gateway's internal `POST /decisions` endpoint. The harness then
+applies deterministic thresholds and re-enters the same registry/execution path as
+an explicit route. Provider failure, route-unidentifiable input, and multi-workflow
+input fail closed rather than selecting a fallback workflow.
 
 ## Operator control
 

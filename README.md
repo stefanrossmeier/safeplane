@@ -15,7 +15,9 @@ Safeplane is a local-first control plane for bounded AI-agent workflows. An
 explicit one-shot CLI connector and the long-running Telegram connector translate
 operator intent, while a deterministic harness owns workflow order, run state,
 permissions, credentials, validation, repository changes, Git operations,
-evidence, and remote-write policy.
+evidence, and remote-write policy. Requests may select a workflow explicitly or
+use the harness-owned routing advisor, which treats Jev output only as bounded
+semantic evidence before deterministic policy accepts a route or abstains.
 
 **Status:** Safeplane is deployed and running on both a MacBook and a VPS,
 including assistant and developer workflows. Public-facing documentation is
@@ -46,6 +48,10 @@ Planned and deferred work is tracked in [Backlog](docs/BACKLOG.md).
   a one-shot connector container and Telegram runs in its own connector service.
   Both select registry-backed entrypoints; connectors do not decide stage order,
   permissions, or policy.
+- **Advisory natural-language routing.** `safeplane auto` and Telegram plain text
+  can ask Jev, through the model gateway, to classify a request as chat, assistant,
+  or developer. The harness applies fixed confidence/ambiguity policy and resolves
+  only registry-backed entrypoints; explicit commands always remain deterministic.
 - **Harness-owned authority.** The harness owns run and session lifecycle,
   retries, terminal states, MCP authorization, authoritative writes, checks,
   credentials, Git operations, draft-PR creation, evidence, and cleanup.
@@ -82,6 +88,7 @@ python3 -m pip install -r requirements-dev.txt
 make setup
 make up
 ./scripts/safeplane chat "Reply with a short confirmation."
+./scripts/safeplane auto "Remind me tomorrow at 09:00 to call the dentist."
 ./scripts/safeplane assistant "List my calendar entries for today."
 ./scripts/safeplane workflows
 ```
@@ -161,9 +168,11 @@ commands.
 - A complete runtime backup-and-restore package is not implemented yet. Current
   backup support is limited to calendar-store safety operations and preserved
   runtime directories.
-- There is no natural-language workflow router, web UI, multi-user isolation,
-  browser automation, Kubernetes deployment, autoscaling, or high availability.
-  Currently workflows have to be selected with slash commands.
+- The routing advisor selects only one of the existing chat, assistant, or
+  developer workflows. Multi-workflow requests and insufficiently identifiable
+  requests abstain; workflow composition is not implemented.
+- There is no web UI, multi-user isolation, browser automation, Kubernetes
+  deployment, autoscaling, or high availability.
 
 ## Documentation
 
@@ -176,6 +185,7 @@ commands.
 - [Local secrets](docs/security/secrets.md)
 - [CLI connector](docs/connectors/cli.md)
 - [Telegram connector](docs/connectors/telegram.md)
+- [Routing advisor](docs/routing-advisor.md)
 - [Repository profiles and workspaces](docs/repository-workspaces.md)
 - [Remote write and draft-PR policy](docs/remote-write.md)
 - [Runtime artifacts and cleanup](docs/runtime-artifacts.md)

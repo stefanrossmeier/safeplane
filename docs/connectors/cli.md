@@ -8,6 +8,7 @@ per networked operator command.
 The CLI connector may:
 
 - parse deterministic operator arguments;
+- request the harness `auto` entrypoint without interpreting routing results itself;
 - validate CLI-only constraints before network access;
 - call the shared connector or control client;
 - render terminal output;
@@ -57,6 +58,7 @@ runs
 status <run-id>
 approve-patch <run-id> <proposal-id>
 approve-pr <run-id>
+auto [--repo <profile>] [--session <ref>] <message>
 chat [--session <ref>] <message>
 assistant [--session <ref>] <message>
 developer [--session <ref>] <message>
@@ -65,7 +67,12 @@ run <entrypoint> [--repo <profile>] [--session <ref>] <message>
 ```
 
 `--repo` is rejected before network access unless the selected entrypoint is
-`develop`.
+`develop` or `auto`. For `auto`, repository context is supplied to the routing
+advisor and is still validated deterministically before the developer workflow
+can run.
+
+`auto` is optional. `chat`, `assistant`, `develop`, `developer`, and
+`run <entrypoint>` remain deterministic explicit routing surfaces.
 
 Use `--output json` for machine-readable output. A message beginning with `-`
 can be passed after `--`.

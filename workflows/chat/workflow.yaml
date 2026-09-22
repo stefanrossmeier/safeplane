@@ -6,6 +6,22 @@ supported_entrypoints:
 examples:
 - Say hello
 - Explain this concept briefly
+routing:
+  summary: >-
+    General conversation, explanation, brainstorming, rewriting, summarization, and
+    generic technical or coding help that does not require Safeplane personal-assistant
+    actions and is not work on a selected repository. Missing pasted text or another
+    task-specific artifact can require clarification without changing the semantic route
+    from chat.
+  positive_signals:
+  - General knowledge questions and conceptual explanations.
+  - Writing, rewriting, summarization, brainstorming, and content drafting with no external action.
+  - Generic programming questions, standalone snippets, algorithms, and debugging not tied to a selected repository.
+  - Requests whose missing detail is an artifact to rewrite or analyze but whose task class is clearly general chat.
+  negative_signals:
+  - Listing, creating, moving, cancelling, or scheduling calendar entries, reminders, or notifications.
+  - Personal time/task organization where assistant capabilities are central.
+  - Inspecting, changing, testing, documenting, or preparing a patch for a selected repository.
 prompt:
   id: chat.system
   version: v1

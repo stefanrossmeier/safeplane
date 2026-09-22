@@ -67,6 +67,8 @@ class FakeHarness:
 
         return {
             "connector": "telegram",
+            "routing_mode": "automatic",
+            "automatic_routing": True,
             "default_entrypoint": "assistant",
             "workflows": [
                 workflow(
@@ -155,6 +157,38 @@ class FakeHarness:
                 repository_profile=repository_profile,
             )
         raise AssertionError(f"Unexpected entrypoint: {entrypoint}")
+
+    def post_auto(
+        self,
+        *,
+        message: str,
+        repository_profile: str | None = None,
+    ) -> dict:
+        assert repository_profile is None
+        self.calls.append({"auto_message": message})
+        run_id = f"run_auto_{len(self.calls)}"
+        response = {
+            "status": "completed",
+            "session_id": "sess_auto_assistant",
+            "session_display_id": "auto1234",
+            "turn": 1,
+            "run_id": run_id,
+            "workflow_id": "assistant",
+            "entrypoint": "assistant",
+            "final_message": f"[fake assistant] {message}",
+            "trace_path": "/tmp/auto-trace",
+            "routing": {"semantic_route": "assistant", "accepted": True},
+        }
+        self.runs[run_id] = {
+            "run_id": run_id,
+            "status": "completed",
+            "session_display_id": "auto1234",
+            "workflow_id": "assistant",
+            "entrypoint": "assistant",
+            "turn": 1,
+            "trace_path": "/tmp/auto-trace",
+        }
+        return response
 
     def post_assistant(self, *, message: str, session_ref: str | None) -> dict:
         self.calls.append(
@@ -321,14 +355,11 @@ def test_telegram_connector_creates_and_continues_assistant_session(tmp_path: Pa
         telegram=telegram,
     )
 
-    assert harness.calls[0] == {
-        "message": "Say hello",
-        "session_ref": None,
-    }
+    assert harness.calls[0] == {"auto_message": "Say hello"}
 
     assert harness.calls[1] == {
         "message": "What did I just ask?",
-        "session_ref": "sess_abc",
+        "session_ref": "sess_auto_assistant",
     }
 
     mapping = store.get(123)
@@ -400,7 +431,7 @@ def test_telegram_status_command_reports_latest_run(tmp_path: Path, monkeypatch)
     )
 
     assert "Latest Safeplane run:" in telegram.sent[-1][1]
-    assert "run: run_1" in telegram.sent[-1][1]
+    assert "run: run_auto_1" in telegram.sent[-1][1]
     assert "status: completed" in telegram.sent[-1][1]
 
 
@@ -419,12 +450,7 @@ def test_telegram_authorization_uses_from_user_id_not_chat_id(tmp_path: Path, mo
         telegram=telegram,
     )
 
-    assert harness.calls == [
-        {
-            "message": "Say hello",
-            "session_ref": None,
-        }
-    ]
+    assert harness.calls == [{"auto_message": "Say hello"}]
     assert telegram.sent == [
         (-100123, "[fake assistant] Say hello"),
     ]
@@ -566,7 +592,7 @@ def test_telegram_workflows_lists_only_registry_exposed_commands(
     assert "/run develop --repo <repository-profile> <task>" not in message
     assert "Send /help for every Telegram command." in message
     assert "/slow" not in message
-    assert "default workflow: assistant" in message
+    assert "routed automatically" in message
 
 
 def test_telegram_help_lists_all_workflow_and_control_commands(
@@ -728,7 +754,7 @@ def test_telegram_generic_run_rejects_missing_flag_unknown_and_hidden_workflows(
     assert "Unknown or unavailable workflow: missing" in telegram.sent[2][1]
 
 
-def test_telegram_plain_text_uses_registry_default_workflow(
+def test_telegram_plain_text_routes_automatically_then_pins_the_session(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("SAFEPLANE_HOME", str(tmp_path))
@@ -737,15 +763,31 @@ def test_telegram_plain_text_uses_registry_default_workflow(
     telegram = FakeTelegram()
 
     handle_update(
-        update=update(123, "Use the default", 1),
+        update=update(123, "Remind me tomorrow to call the dentist", 1),
+        allowed_user_ids={123},
+        store=store,
+        harness=harness,
+        telegram=telegram,
+    )
+    handle_update(
+        update=update(123, "Make that 10 AM instead", 2),
         allowed_user_ids={123},
         store=store,
         harness=harness,
         telegram=telegram,
     )
 
-    assert harness.calls == [{"message": "Use the default", "session_ref": None}]
-    assert telegram.sent == [(123, "[fake assistant] Use the default")]
+    assert harness.calls == [
+        {"auto_message": "Remind me tomorrow to call the dentist"},
+        {"message": "Make that 10 AM instead", "session_ref": "sess_auto_assistant"},
+    ]
+    assert telegram.sent == [
+        (123, "[fake assistant] Remind me tomorrow to call the dentist"),
+        (123, "[fake assistant] Make that 10 AM instead"),
+    ]
+    binding = store.automatic_binding(123)
+    assert binding is not None
+    assert binding["entrypoint"] == "assistant"
 
 
 def test_long_polling_records_readiness_and_replies_when_command_processing_fails(

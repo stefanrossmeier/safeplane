@@ -10,6 +10,7 @@ filesystem administration commands continue to dispatch to focused host tools.
 make setup
 make up
 ./scripts/safeplane chat "Reply with a short confirmation."
+./scripts/safeplane auto "Remind me tomorrow morning to review the release notes."
 ./scripts/safeplane workflows
 make down
 ```
@@ -77,6 +78,19 @@ tests/scripts/accept-cli-connector
 The runtime check proves harness reachability while denying runtime mounts,
 secret mounts, Docker-socket access, model-service resolution, and MCP-service
 resolution from the CLI container.
+
+## Routing advisor validation
+
+Automatic routing is covered by the normal offline unit suite. To exercise the
+real Jev decision path through the production model-gateway transport, run:
+
+```bash
+make test-routing-jev
+```
+
+The live suite is opt-in, requires the normal OpenRouter secret, and performs
+provider calls only for routing decisions. It does not run downstream workflow
+model inference.
 
 ## CLI connector troubleshooting
 

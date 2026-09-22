@@ -228,6 +228,18 @@ class HarnessClient:
             timeout=timeout,
         )
 
+    def post_auto(
+        self,
+        *,
+        message: str,
+        repository_profile: str | None = None,
+    ) -> dict[str, Any]:
+        return self.post_workflow(
+            entrypoint="auto",
+            message=message,
+            repository_profile=repository_profile,
+        )
+
     def post_assistant(self, *, message: str, session_ref: str | None) -> dict[str, Any]:
         return self.post_workflow(
             entrypoint="assistant",
@@ -350,6 +362,45 @@ class TelegramSessionStore:
             response=response,
         )
 
+    def automatic_binding(self, chat_id: int) -> dict[str, str] | None:
+        mapping = self.get(chat_id) or {}
+        workflow_id = str(mapping.get("automatic_workflow_id") or "").strip()
+        entrypoint = str(mapping.get("automatic_entrypoint") or "").strip()
+        if not workflow_id or not entrypoint:
+            return None
+        session_ref = self.session_ref(chat_id, workflow_id)
+        if not session_ref:
+            return None
+        return {
+            "workflow_id": workflow_id,
+            "entrypoint": entrypoint,
+            "session_ref": session_ref,
+        }
+
+    def record_automatic_run(
+        self,
+        chat_id: int,
+        *,
+        entrypoint: str,
+        workflow_id: str,
+        response: dict[str, Any],
+    ) -> dict[str, Any]:
+        mapping = self.record_workflow_run(
+            chat_id,
+            entrypoint=entrypoint,
+            workflow_id=workflow_id,
+            response=response,
+        )
+        data = self.load()
+        key = self.key(chat_id)
+        mapping = dict(data.get(key) or mapping)
+        mapping["automatic_entrypoint"] = entrypoint
+        mapping["automatic_workflow_id"] = workflow_id
+        mapping["updated_at"] = utc_now()
+        data[key] = mapping
+        self.save(data)
+        return mapping
+
     def clear(self, chat_id: int, workflow_id: str | None = None) -> None:
         data = self.load()
         key = self.key(chat_id)
@@ -386,8 +437,16 @@ def format_workflows(payload: dict[str, Any]) -> str:
             "Send /help for every Telegram command.",
         ]
     )
+    routing_mode = str(payload.get("routing_mode") or "default_entrypoint")
     default_entrypoint = payload.get("default_entrypoint")
-    if default_entrypoint:
+    if routing_mode == "automatic" and payload.get("automatic_routing"):
+        lines.extend(
+            [
+                "",
+                "Plain text is routed automatically. The selected workflow remains bound until /new.",
+            ]
+        )
+    elif default_entrypoint:
         lines.extend(
             [
                 "",
@@ -429,8 +488,17 @@ def format_help(payload: dict[str, Any]) -> str:
         usage = str(metadata.get("usage") or "").strip()
         if run_usage and run_usage != usage:
             lines.append(f"  {run_usage}")
+    routing_mode = str(payload.get("routing_mode") or "default_entrypoint")
     default_entrypoint = payload.get("default_entrypoint")
-    if default_entrypoint:
+    if routing_mode == "automatic" and payload.get("automatic_routing"):
+        lines.extend(
+            [
+                "",
+                "Plain text is routed automatically on the first message after /new.",
+                "Later plain text continues that selected workflow; slash commands stay deterministic.",
+            ]
+        )
+    elif default_entrypoint:
         lines.extend(
             [
                 "",
@@ -915,6 +983,66 @@ def handle_update(
         return
 
     payload = exposed_workflows()
+    routing_mode = str(payload.get("routing_mode") or "default_entrypoint")
+    if routing_mode == "automatic" and payload.get("automatic_routing"):
+        binding = store.automatic_binding(chat_id)
+        if binding is not None:
+            workflow = workflow_by_entrypoint(payload, binding["entrypoint"])
+            if workflow is None:
+                store.clear(chat_id)
+                telegram.send_message(
+                    chat_id,
+                    "The previously routed workflow is no longer available. Send the message again to reroute it.",
+                )
+                return
+            dispatch_workflow(
+                chat_id=chat_id,
+                workflow=workflow,
+                argument_text=stripped,
+                generic_run=False,
+                store=store,
+                harness=harness,
+                telegram=telegram,
+            )
+            return
+
+        try:
+            response = harness.post_auto(message=stripped)
+        except Exception as exc:
+            telegram.send_message(
+                chat_id,
+                f"Automatic routing could not select a workflow: {exc}",
+            )
+            return
+        entrypoint = str(response.get("entrypoint") or "")
+        workflow_id = str(response.get("workflow_id") or "")
+        workflow = workflow_by_entrypoint(payload, entrypoint)
+        if workflow is None or not workflow_id:
+            telegram.send_message(
+                chat_id,
+                "Automatic routing returned an unavailable workflow. Use an explicit slash command.",
+            )
+            return
+        store.record_automatic_run(
+            chat_id,
+            entrypoint=entrypoint,
+            workflow_id=workflow_id,
+            response=response,
+        )
+        final_message = response.get("final_message") or "(Safeplane returned no final message.)"
+        telegram.send_message(chat_id, final_message)
+        write_event(
+            "workflow_started",
+            {
+                "telegram_chat_id": chat_id,
+                "entrypoint": entrypoint,
+                "workflow_id": workflow_id,
+                "run_id": response.get("run_id"),
+                "routing_mode": "automatic",
+            },
+        )
+        return
+
     default_entrypoint = str(payload.get("default_entrypoint") or "")
     workflow = workflow_by_entrypoint(payload, default_entrypoint)
     if workflow is None:

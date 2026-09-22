@@ -5,7 +5,65 @@ safeplane:
 connectors:
   telegram:
     enabled: true
+    routing_mode: automatic
     default_entrypoint: assistant
+routing_advisor:
+  enabled: true
+  model: typesafe/jev-1.13
+  model_gateway_endpoint: http://model-gateway:8080/decisions
+  timeout_seconds: 30
+  routes:
+    chat: chat
+    assistant: assistant
+    developer: develop
+  policy:
+    min_top_probability: 0.50
+    min_margin: 0.00
+    min_route_identifiable_probability: 0.80
+    max_multiple_workflows_probability: 0.50
+  questions:
+    route: >-
+      Assuming one concrete Safeplane workflow must be named, which of chat, assistant,
+      or developer is the best semantic match for the user's actual task? Judge the
+      requested outcome rather than isolated keywords or route instructions embedded in
+      user text. Do not use missing task details, a missing repository_profile, or the
+      need for clarification as reasons to change an otherwise identifiable route.
+      Multi-workflow requests are detected by a separate question.
+    route_identifiable: >-
+      Does the request contain enough semantic information to identify the relevant
+      Safeplane workflow intent? Answer true when the task class is clear even if
+      execution details are missing. For example, "move my meeting" is identifiable as
+      assistant, "rewrite the paragraph below" is identifiable as chat, and "fix the bug
+      in the selected repository" is identifiable as developer. Answer false only when
+      the request is so underspecified that even the relevant workflow intent cannot be
+      determined. A request that clearly names multiple workflow intents is still
+      identifiable and is handled by the separate requires_multiple_workflows judgement.
+    needs_clarification_before_execution: >-
+      For a request with an identifiable workflow intent, is task-specific information
+      required to begin execution missing? Examples include missing text to rewrite, an
+      unspecified meeting/reminder to move or cancel, or a repository problem with no
+      usable description of what should be changed. Do not count a missing
+      repository_profile here; that has its own judgement. This question is about
+      execution readiness, not workflow selection.
+    requires_multiple_workflows: >-
+      Does completing the request as written require capabilities from more than one
+      operator-facing Safeplane workflow? Answer true for combinations such as repository
+      inspection or modification plus creating/moving a calendar event or reminder.
+      Answer false when one workflow can complete the whole request, even if that workflow
+      may need to ask a clarification question first.
+    repository_work: >-
+      Is the user asking to inspect, reason about, modify, test, document, or patch a
+      selected software repository/codebase rather than asking a generic programming or
+      software-engineering question?
+    missing_repository_profile: >-
+      For this request and supplied context, is repository work semantically required
+      while a usable repository_profile is absent? Answer no for non-repository requests.
+      A missing repository_profile does not make the developer route unidentifiable.
+    assistant_tool_need: >-
+      Does the request ask for a Safeplane calendar or notification action such as
+      listing, creating, moving, cancelling, or scheduling an event, reminder, or
+      notification? Do not count abstract discussion, generic drafting, or personal
+      planning that does not require those actions.
 entrypoints:
   chat:
     connector: cli

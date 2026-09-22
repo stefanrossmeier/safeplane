@@ -195,6 +195,51 @@ def test_cli_workflow_request_preserves_message_session_and_repository_profile()
     ]
 
 
+def test_cli_auto_routes_without_requiring_an_explicit_workflow() -> None:
+    with fake_harness() as (url, captured):
+        result = cli(
+            "auto",
+            "Remind",
+            "me",
+            "tomorrow",
+            "to",
+            "call",
+            "the",
+            "dentist",
+            harness_url=url,
+        )
+    assert result.returncode == 0, result.stderr
+    assert captured == [
+        {
+            "method": "POST",
+            "path": "/connector/auto",
+            "payload": {
+                "connector": "cli",
+                "message": "Remind me tomorrow to call the dentist",
+            },
+        }
+    ]
+
+
+def test_cli_auto_accepts_repository_context_for_developer_routing() -> None:
+    with fake_harness() as (url, captured):
+        result = cli(
+            "auto",
+            "--repo",
+            "target",
+            "Fix",
+            "the",
+            "bug",
+            "in",
+            "this",
+            "repository",
+            harness_url=url,
+        )
+    assert result.returncode == 0, result.stderr
+    assert captured[0]["path"] == "/connector/auto"
+    assert captured[0]["payload"]["repository_profile"] == "target"
+
+
 def test_cli_json_output_is_machine_readable_and_stdout_only() -> None:
     with fake_harness() as (url, _):
         result = cli("workflows", "--output", "json", harness_url=url)
@@ -230,7 +275,7 @@ def test_cli_rejects_repo_for_non_develop_before_network_access() -> None:
     with fake_harness() as (url, captured):
         result = cli("run", "assistant", "--repo", "target", "message", harness_url=url)
     assert result.returncode == 2
-    assert "--repo is only valid for the develop entrypoint" in result.stderr
+    assert "--repo is only valid for the develop or auto entrypoint" in result.stderr
     assert captured == []
 
 
@@ -281,6 +326,7 @@ def test_cli_help_documents_full_network_command_surface() -> None:
         "approve-patch",
         "approve-pr",
         "run",
+        "auto",
         "chat",
         "assistant",
         "developer",

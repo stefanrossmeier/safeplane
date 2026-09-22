@@ -65,6 +65,10 @@ def build_parser() -> Parser:
     run.add_argument("entrypoint")
     _add_workflow_arguments(run, allow_repo=True)
 
+    auto = sub.add_parser("auto", help="Route a request through the routing advisor")
+    _add_output_argument(auto)
+    _add_workflow_arguments(auto, allow_repo=True)
+
     for name in ("chat", "assistant", "developer"):
         command = sub.add_parser(name, help=f"Invoke the {name} entrypoint")
         _add_output_argument(command)
@@ -127,8 +131,8 @@ def execute(args: argparse.Namespace, *, output: str, client: HarnessClient) -> 
 
     entrypoint = args.entrypoint if args.command == "run" else args.command
     repository_profile = getattr(args, "repository_profile", None)
-    if repository_profile and entrypoint != "develop":
-        raise CliUsageError("--repo is only valid for the develop entrypoint")
+    if repository_profile and entrypoint not in {"develop", "auto"}:
+        raise CliUsageError("--repo is only valid for the develop or auto entrypoint")
     result = client.connector.start_workflow(
         entrypoint,
         _message(args.message),

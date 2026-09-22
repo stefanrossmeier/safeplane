@@ -30,6 +30,8 @@ def test_harness_lists_only_telegram_exposed_operator_workflows(
 
     assert response["connector"] == "telegram"
     assert response["default_entrypoint"] == "assistant"
+    assert response["routing_mode"] == "automatic"
+    assert response["automatic_routing"] is True
     assert [item["entrypoint"] for item in response["workflows"]] == [
         "assistant",
         "chat",

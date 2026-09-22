@@ -86,7 +86,7 @@ measured operator value and evidence from real use.
 | --- | --- | --- |
 | Bounded developer rework loop | Allows one run to react to review findings instead of requiring a new run | Strict attempt limit, unchanged approved scope, repeated checks and independent review, explicit terminal states, no self-granted permissions |
 | Safeplane developing Safeplane | Exercises the developer workflow against its own codebase | Strong recovery path, isolated authority, no recursive credential access, operator-controlled publication, external-repository behavior already stable |
-| Deterministic routing advisor | Helps choose among a larger set of explicit workflows | Router remains authoritative, model output is advisory and schema-validated, ambiguity fails safely, decisions are inspectable and testable |
+| Multi-workflow composition | Allows compound requests that currently make the routing advisor abstain | Explicit composition contract, bounded workflow graph, no implicit authority union, inspectable intermediate state and failure semantics |
 | Persistent notes or semantic memory | Reuses durable project knowledge across sessions | Explicit provenance, bounded retrieval, deletion and correction controls, no silent authority over current repository facts |
 | Web operator interface | Improves run, evidence, and approval inspection | Authentication and single-operator threat model, no bypass of harness policy, no new public port without a deployment decision |
 | Additional connectors | Adds Slack, email, or other operator channels | Thin deterministic translation, explicit workflow exposure, connector-specific secret isolation, no connector-owned orchestration |

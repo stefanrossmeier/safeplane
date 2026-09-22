@@ -8,6 +8,22 @@ examples:
 - Inspect this repository and explain its architecture
 - Propose a focused patch for this bug
 - Run the staged developer workflow for this bounded task
+routing:
+  summary: >-
+    Repository-scoped software engineering using Safeplane's developer workflow: inspect,
+    analyze, modify, test, document, or prepare a bounded patch for a selected software
+    repository. Missing task details or a missing repository_profile are execution
+    prerequisites, not reasons to relabel an otherwise clear repository request as chat
+    or route-unidentifiable.
+  positive_signals:
+  - Inspect or explain architecture, files, history, tests, configuration, or behavior of a selected repository.
+  - Fix a bug, implement a feature, refactor code, update configuration, or change repository documentation.
+  - Run repository checks, reason about failing repository tests, or prepare a focused patch.
+  - Requests that clearly make a selected repository/codebase the object of the requested work.
+  negative_signals:
+  - Generic programming education, standalone snippets, interview practice, or conceptual software questions.
+  - Calendar, reminder, or personal task management.
+  - A request with no identifiable repository/software-engineering intent at all.
 prompt:
   id: developer.system
   version: v1

@@ -1,0 +1,11 @@
+{
+  "configured_model": "typesafe/jev-1.13",
+  "corpus_sha256": "4e98bb8d0bafaa157933ba45fbd0833dceef1cabdcb85c7ab86f43cb42711ccd",
+  "safeplane_yaml_sha256": "7571232c8cb01689762d96531696c8196667ba4b6a6f7d5069af8f3c83bd57a9",
+  "semantics_sha256": "0f0c8d52159a3c105695b4621a59127b1bcf8d5c2bfd13d93cb856bed48a36c7",
+  "workflow_sha256": {
+    "assistant": "73561022cc85e5fbdfe05ba740aa7cc3348df7eb6296b2c4d15506f5af6ae659",
+    "chat": "da5ff2e7b6aae811278e895968d30f503da76a635a8b6d5dc6ec50b5cb0ad157",
+    "developer": "4ba6de425157f78f2b477d9ae33d2ca2fd958e57f785e6f632e140807617d0db"
+  }
+}

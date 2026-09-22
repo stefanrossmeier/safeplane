@@ -4,7 +4,7 @@
 	accept-repository-workspaces accept-developer-tools accept-external-documentation \
 	accept-developer-workflow accept-draft-pr-workflow accept-publication-path \
 	accept-telegram-workflows accept-repository-cleanup accept-runtime-hardening accept-cli-connector accept-documentation check-repository-hygiene normalize-repository-hygiene prepare-runtime-layout wait smoke-real clean-data \
-	secret-set secret-set-openrouter secret-set-github secrets-list storage \
+	secret-set secret-set-openrouter secret-set-github secrets-list storage test-routing-jev \
 	clean-artifacts-dry-run clean-artifacts clean-all
 
 setup:
@@ -53,6 +53,9 @@ test:
 
 test-acceptance:
 	pytest tests/acceptance
+
+test-routing-jev:
+	SAFEPLANE_RUN_LIVE_JEV=1 pytest -q tests/live/test_routing_advisor_jev.py
 
 check-repository-hygiene:
 	tests/scripts/check-repository-hygiene

@@ -25,6 +25,14 @@ from harness.remote_write import (
     RemoteWriteResult,
     execute_remote_write,
 )
+from harness.routing_advisor import (
+    RoutingAdvisorAbstainedError,
+    RoutingAdvisorPrerequisiteError,
+    RoutingAdvisorUnavailableError,
+    RoutingDecision,
+    route_message,
+    write_routing_trace,
+)
 from harness.run_store import (
     TERMINAL_RUN_STATUSES,
     create_run,
@@ -86,8 +94,11 @@ class ConnectorMessageResponse(BaseModel):
     session_display_id: str
     turn: int
     run_id: str
+    workflow_id: str
+    entrypoint: str
     final_message: str | None = None
     trace_path: str
+    routing: dict[str, Any] | None = None
 
 
 class PatchApprovalRequest(BaseModel):
@@ -1015,10 +1026,105 @@ def handle_connector_entrypoint(
     request: ConnectorMessageRequest,
     *,
     wait_for_completion: bool = True,
+    routing_decision: RoutingDecision | None = None,
 ) -> ConnectorMessageResponse:
     ensure_runtime_dirs()
 
     config = load_safeplane_config()
+
+    if entrypoint_name == "auto":
+        registry = build_registry(config, safeplane_config_path())
+        if request.session_ref:
+            try:
+                session = resolve_session_reference(request.session_ref)
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            workflow_id = str(session.get("workflow_id") or "")
+            routes = dict((config.get("routing_advisor") or {}).get("routes") or {})
+            candidates = [
+                str(entrypoint)
+                for entrypoint in routes.values()
+                if str(entrypoint) in registry
+                and registry[str(entrypoint)].workflow_id == workflow_id
+                and connector_is_exposed(registry[str(entrypoint)], request.connector)
+            ]
+            if len(candidates) != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot continue automatic session for workflow {workflow_id!r}; "
+                        "use an explicit workflow command."
+                    ),
+                )
+            return handle_connector_entrypoint(
+                candidates[0],
+                request,
+                wait_for_completion=wait_for_completion,
+            )
+
+        routing_id = f"route_{uuid.uuid4()}"
+        decision: RoutingDecision | None = None
+        try:
+            decision = route_message(
+                config=config,
+                registry=registry,
+                connector=request.connector,
+                message=request.message,
+                repository_profile=request.repository_profile,
+                routing_id=routing_id,
+            )
+        except RoutingAdvisorAbstainedError as exc:
+            write_routing_trace(
+                safeplane_home=safeplane_home(),
+                routing_id=routing_id,
+                connector=request.connector,
+                message=request.message,
+                repository_profile=request.repository_profile,
+                decision=exc.decision,
+                error=exc,
+            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RoutingAdvisorPrerequisiteError as exc:
+            write_routing_trace(
+                safeplane_home=safeplane_home(),
+                routing_id=routing_id,
+                connector=request.connector,
+                message=request.message,
+                repository_profile=request.repository_profile,
+                decision=exc.decision,
+                error=exc,
+            )
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RoutingAdvisorUnavailableError as exc:
+            write_routing_trace(
+                safeplane_home=safeplane_home(),
+                routing_id=routing_id,
+                connector=request.connector,
+                message=request.message,
+                repository_profile=request.repository_profile,
+                error=exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=f"Automatic routing is unavailable: {exc}. Use an explicit workflow command.",
+            ) from exc
+
+        write_routing_trace(
+            safeplane_home=safeplane_home(),
+            routing_id=decision.routing_id,
+            connector=request.connector,
+            message=request.message,
+            repository_profile=request.repository_profile,
+            decision=decision,
+        )
+        return handle_connector_entrypoint(
+            str(decision.entrypoint),
+            request,
+            wait_for_completion=wait_for_completion,
+            routing_decision=decision,
+        )
 
     try:
         resolved = resolve_entrypoint(config, entrypoint_name)
@@ -1175,6 +1281,27 @@ def handle_connector_entrypoint(
         },
     )
 
+    if routing_decision is not None:
+        write_trace(
+            session_id=session_id,
+            turn=turn,
+            run_id=run_id,
+            event="routing_advisor_decision",
+            input_data={
+                "routing_id": routing_decision.routing_id,
+                "requested_entrypoint": "auto",
+            },
+            output_data=routing_decision.to_dict(),
+            artifact_refs=[
+                str(
+                    safeplane_home()
+                    / "traces"
+                    / "routing"
+                    / f"{routing_decision.routing_id}.json"
+                )
+            ],
+        )
+
     RUN_EXECUTOR.submit(
         execute_run,
         run_id=run_id,
@@ -1196,8 +1323,11 @@ def handle_connector_entrypoint(
             session_display_id=session_display_id,
             turn=turn,
             run_id=run_id,
+            workflow_id=workflow_id,
+            entrypoint=entrypoint_name,
             final_message=None,
             trace_path=str(current_trace_dir),
+            routing=routing_decision.to_dict() if routing_decision is not None else None,
         )
 
     try:
@@ -1224,8 +1354,11 @@ def handle_connector_entrypoint(
         session_display_id=session_display_id,
         turn=turn,
         run_id=run_id,
+        workflow_id=workflow_id,
+        entrypoint=entrypoint_name,
         final_message=completed_run.get("final_message"),
         trace_path=str(current_trace_dir),
+        routing=routing_decision.to_dict() if routing_decision is not None else None,
     )
 
 
@@ -1333,6 +1466,11 @@ def list_workflows(
             )
         response["connector"] = connector
         response["default_entrypoint"] = default_entrypoint
+        response["routing_mode"] = connector_config.get("routing_mode", "default_entrypoint")
+        response["automatic_routing"] = bool(
+            (config.get("routing_advisor") or {}).get("enabled", False)
+            and response["routing_mode"] == "automatic"
+        )
     return response
 
 

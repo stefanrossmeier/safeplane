@@ -10,7 +10,7 @@ After MVP 4, Safeplane had more than one workflow.
 
 The system needed a structured way to list and resolve workflows without introducing probabilistic routing too early.
 
-Routing is still intentionally deferred.
+At the time of this decision, natural-language routing was still intentionally deferred.
 
 ## Decision
 
@@ -49,7 +49,7 @@ The CLI also supports explicit generic execution:
 
     safeplane run <entrypoint> "message"
 
-There is no LLM router, fuzzy matching, or advisor in MVP 5.
+There was no LLM router, fuzzy matching, or advisor in MVP 5. ADR 0031 later adds an advisory router on top of this registry without replacing deterministic entrypoint resolution.
 
 ## Consequences
 
@@ -59,4 +59,4 @@ Unknown entrypoints fail clearly.
 
 Disabled workflows can be represented in configuration.
 
-Future routing or advisor workflows can build on a validated registry instead of hardcoded workflow knowledge.
+ADR 0031 builds advisory routing on this validated registry instead of allowing model output to bypass or replace it.

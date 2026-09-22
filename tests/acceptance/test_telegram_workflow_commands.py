@@ -93,6 +93,23 @@ class RegistryBackedHarness:
         }
         return response
 
+    def post_auto(
+        self,
+        *,
+        message: str,
+        repository_profile: str | None = None,
+    ) -> dict:
+        assert repository_profile is None
+        response = self.post_workflow(
+            entrypoint="assistant",
+            message=message,
+            start_async=False,
+        )
+        response["workflow_id"] = "assistant"
+        response["entrypoint"] = "assistant"
+        response["routing"] = {"semantic_route": "assistant", "accepted": True}
+        return response
+
     def get_run(self, run_id: str) -> dict:
         return self.runs[run_id]
 
@@ -158,3 +175,27 @@ def test_registry_backed_telegram_commands_reach_every_exposed_workflow(
     assert any("/run develop --repo" in message for message in telegram.sent)
     assert any("Ready for PR approval" in message for message in telegram.sent)
     assert any("Unknown or unavailable workflow: slow" in message for message in telegram.sent)
+
+
+def test_registry_backed_telegram_plain_text_uses_automatic_routing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("SAFEPLANE_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SAFEPLANE_CONFIG", str(REPO_ROOT / "safeplane.yaml"))
+    store = TelegramSessionStore(tmp_path / "telegram-sessions.json")
+    harness = RegistryBackedHarness()
+    telegram = FakeTelegram()
+
+    handle_update(
+        update=update("Remind me tomorrow at 09:00 to call the dentist", 1),
+        allowed_user_ids={123},
+        store=store,
+        harness=harness,
+        telegram=telegram,
+    )
+
+    assert harness.calls[0]["entrypoint"] == "assistant"
+    assert telegram.sent[-1].startswith("[assistant]")
+    binding = store.automatic_binding(123)
+    assert binding is not None
+    assert binding["workflow_id"] == "assistant"
