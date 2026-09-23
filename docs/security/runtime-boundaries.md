@@ -27,6 +27,9 @@ flowchart LR
     MG -->|model-egress| OR[OpenRouter]
     H -->|harness-tools| CAL[Calendar MCP]
     H -->|harness-tools| NOTIF[Notification MCP]
+    H -->|research-gateway| WRG[Web research gateway]
+    WRG -->|research-control| WRA[Web research agent]
+    WRA -->|research-egress| WEB[Public Internet]
     NOTIF -->|notification-delivery| SCH[Scheduler]
     SCH -->|notification-delivery| TG
     H -->|dev-workspace-internal| READ[Workspace MCP]
@@ -42,9 +45,11 @@ flowchart LR
 
 | Service | Calls or receives calls | Networks | Writable mounts | Read-only mounts | Secret mounts | External egress | Host ports |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `harness` | receives CLI/Telegram requests; calls model gateway, MCP services, Git, and GitHub | `harness-egress`, `harness-model`, `harness-tools`, `connector-harness`; optional `dev-workspace-internal`, `github-mock-internal` | `sessions`, `runs`, `traces`, `workspaces`, `logs/mcp`; test-only `publication-remotes` volume | `config`, `safeplane.yaml`, `workflows`, `prompts`; optional developer source and local Git fixtures | `github_token` only in GitHub mode | Git and GitHub | `127.0.0.1:8787` only with local overlay; `127.0.0.1:18787` in test overlay |
+| `harness` | receives CLI/Telegram requests; calls model gateway, MCP services, the web-research gateway, Git, and GitHub | `harness-egress`, `harness-model`, `harness-tools`, `research-gateway`, `connector-harness`; optional `dev-workspace-internal`, `github-mock-internal` | `sessions`, `runs`, `traces`, `workspaces`, `logs/mcp`; test-only `publication-remotes` volume | `config`, `safeplane.yaml`, `workflows`, `prompts`; optional developer source and local Git fixtures | `github_token` only in GitHub mode | Git and GitHub | `127.0.0.1:8787` only with local overlay; `127.0.0.1:18787` in test overlay |
 | `cli-connector` | receives one operator command; calls harness | `connector-harness` | none | none | none | none | none |
 | `model-gateway` | receives model requests from harness; calls provider in real mode | `harness-model`, `model-egress` | `traces` | `workflows`, `prompts` | `openrouter_api_key` only in real mode | OpenRouter in real mode | none |
+| `web-research-gateway` | receives schema-validated research RPCs from harness; forwards them to the isolated research agent | `research-gateway`, `research-control` | none | none | none | none | none |
+| `web-research-agent` | receives public research requests from gateway; calls Brave, OpenRouter, and fetched public pages | `research-control`, `research-egress` | none | dedicated web-research credential directory at `/run/secrets/web-research` | `brave_api_key`, `openrouter_api_key` from the dedicated mounted directory only | Brave, OpenRouter, and allowlisted/public fetched pages | none |
 | `calendar-task-mcp` | receives harness-brokered calendar calls | `harness-tools` | `data/calendar`, `logs/mcp` | none | none | none | none |
 | `notification-task-mcp` | receives harness-brokered notification calls; requests scheduler reload/delivery work | `harness-tools`, `notification-delivery` | `data/notifications`, `logs/mcp` | none | none | none | none |
 | `scheduler` | receives notification work; calls Telegram connector when enabled | `notification-delivery` | `data/notifications`, `logs/scheduler` | `data/calendar` | none | none | none |

@@ -49,6 +49,8 @@ from harness.run_store import load_run, update_run
 PIPELINE_VERSION = "v1"
 DEFAULT_FAKE_SCENARIO = "default"
 FAKE_SCENARIO_PREFIX = "[safeplane-fake-scenario:"
+ANALYSIS_RESEARCH_TOOL_CALL_LIMIT = 2
+ANALYSIS_RESEARCH_TOOL_LOOP_TIMEOUT_SECONDS = 180
 
 
 class DeveloperPipelineError(RuntimeError):
@@ -118,6 +120,13 @@ class AnalysisResult(StrictModel):
     assumptions: list[str]
     open_questions: list[str]
     scope_risks: list[str]
+
+
+class AnalysisToolCall(StrictModel):
+    type: Literal["tool_call"]
+    server_id: Literal["web-research"]
+    tool_name: Literal["web_research_clarify"]
+    arguments: dict[str, Any]
 
 
 class FileChangePolicy(StrictModel):
@@ -517,6 +526,16 @@ class StageModelCallResult:
     model: dict[str, Any]
     usage: dict[str, Any] | None = None
     finish_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class AnalysisAgentLoopResult:
+    artifact: AnalysisResult
+    final_call: StageModelCallResult
+    retry_count: int
+    model_call_count: int
+    tool_call_count: int
+    usage: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -1382,6 +1401,19 @@ def _configured_agent_tools(agent: dict[str, Any]) -> dict[str, set[str]]:
     return result
 
 
+def _validate_analysis_tool_call(
+    tool_call: AnalysisToolCall,
+    *,
+    agent: dict[str, Any],
+) -> None:
+    allowed = _configured_agent_tools(agent)
+    if tool_call.server_id not in allowed:
+        raise DeveloperPipelineError("analysis web-research server is not allowed")
+    if tool_call.tool_name not in allowed[tool_call.server_id]:
+        raise DeveloperPipelineError("analysis web-research tool is not allowed")
+    validate_tool_input(tool_call.tool_name, tool_call.arguments)
+
+
 def _validate_implementation_tool_call(
     tool_call: ImplementationToolCall,
     *,
@@ -1420,6 +1452,190 @@ def _accumulate_model_usage(
     if isinstance(cost, (int, float)) and not isinstance(cost, bool):
         result["cost"] = float(result.get("cost") or 0.0) + float(cost)
     return result or None
+
+
+def _run_analysis_agent_loop(
+    *,
+    agent: dict[str, Any],
+    model_profile: str,
+    response_key: str,
+    system_prompt: str,
+    user_message: str,
+    max_attempts: int,
+    call_stage_model: StageModelCaller,
+    call_stage_tool: StageToolCaller | None,
+    trace: TraceWriter,
+    store: DeveloperPipelineStore,
+) -> AnalysisAgentLoopResult:
+    """Allow only bounded public-research clarification before AnalysisResult."""
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+    deadline = time.monotonic() + ANALYSIS_RESEARCH_TOOL_LOOP_TIMEOUT_SECONDS
+    invalid_attempts = 0
+    model_call_count = 0
+    tool_call_count = 0
+    total_usage: dict[str, Any] | None = None
+    trace(
+        "developer_pipeline_analysis_research_loop_started",
+        {
+            "stage_id": "analysis",
+            "timeout_seconds": ANALYSIS_RESEARCH_TOOL_LOOP_TIMEOUT_SECONDS,
+            "max_validation_attempts": max_attempts,
+            "tool_call_limit": ANALYSIS_RESEARCH_TOOL_CALL_LIMIT,
+        },
+        None,
+        None,
+        None,
+    )
+    while True:
+        if time.monotonic() >= deadline:
+            raise DeveloperPipelineError(
+                "analysis research loop exceeded its wall-clock deadline before "
+                "the model returned a valid AnalysisResult"
+            )
+        call_result = call_stage_model(
+            "analysis",
+            response_key,
+            model_profile,
+            messages,
+        )
+        model_call_count += 1
+        total_usage = _accumulate_model_usage(total_usage, call_result.usage)
+        content = call_result.content
+        try:
+            raw = extract_json_object(content)
+            if raw.get("type") == "tool_call":
+                if tool_call_count >= ANALYSIS_RESEARCH_TOOL_CALL_LIMIT:
+                    raise DeveloperPipelineError(
+                        "analysis exceeded the public web-research call limit"
+                    )
+                tool_call = AnalysisToolCall.model_validate(raw)
+                _validate_analysis_tool_call(tool_call, agent=agent)
+                tool_call_count += 1
+                tool_error: dict[str, str] | None = None
+                tool_content: dict[str, Any] = {}
+                try:
+                    if call_stage_tool is None:
+                        raise DeveloperPipelineError(
+                            "analysis web-research tool caller is unavailable"
+                        )
+                    tool_content = call_stage_tool(
+                        "analysis",
+                        "analysis",
+                        tool_call.server_id,
+                        tool_call.tool_name,
+                        tool_call.arguments,
+                        None,
+                        None,
+                    )
+                except Exception as exc:
+                    tool_error = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                tool_result = {
+                    "type": "tool_result",
+                    "server_id": tool_call.server_id,
+                    "tool_name": tool_call.tool_name,
+                    "ok": tool_error is None,
+                    "result": tool_content if tool_error is None else None,
+                    "error": tool_error,
+                }
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": content},
+                        {
+                            "role": "user",
+                            "content": (
+                                "Safeplane executed the isolated public-research request.\n"
+                                "Tool result JSON:\n"
+                                + json.dumps(
+                                    tool_result,
+                                    ensure_ascii=False,
+                                    indent=2,
+                                    default=str,
+                                )
+                                + "\n\nUse the result only as external clarification. "
+                                "Return the final AnalysisResult when ready."
+                            ),
+                        },
+                    ]
+                )
+                trace(
+                    "developer_pipeline_analysis_research_turn_completed",
+                    {
+                        "stage_id": "analysis",
+                        "tool_call_index": tool_call_count,
+                        "server_id": tool_call.server_id,
+                        "tool_name": tool_call.tool_name,
+                    },
+                    {"ok": tool_error is None, "model_call_count": model_call_count},
+                    None,
+                    tool_error,
+                )
+                continue
+            artifact = AnalysisResult.model_validate(raw)
+            final_call = StageModelCallResult(
+                content=call_result.content,
+                model=call_result.model,
+                usage=total_usage,
+                finish_reason=call_result.finish_reason,
+            )
+            return AnalysisAgentLoopResult(
+                artifact=artifact,
+                final_call=final_call,
+                retry_count=invalid_attempts,
+                model_call_count=model_call_count,
+                tool_call_count=tool_call_count,
+                usage=total_usage,
+            )
+        except Exception as exc:
+            invalid_attempts += 1
+            trace(
+                "developer_pipeline_stage_attempt_failed",
+                {
+                    "stage_id": "analysis",
+                    "agent_id": "analysis",
+                    "attempt": invalid_attempts,
+                    "max_attempts": max_attempts,
+                    "model_call_count": model_call_count,
+                    "tool_call_count": tool_call_count,
+                },
+                None,
+                None,
+                {"type": type(exc).__name__, "message": str(exc)},
+            )
+            store.append_event(
+                event="stage_attempt_failed",
+                stage_id="analysis",
+                data={
+                    "attempt": invalid_attempts,
+                    "max_attempts": max_attempts,
+                    "error_type": type(exc).__name__,
+                    "model_call_count": model_call_count,
+                    "tool_call_count": tool_call_count,
+                },
+            )
+            if invalid_attempts >= max_attempts:
+                raise DeveloperPipelineError(
+                    "stage analysis produced no valid output after "
+                    f"{max_attempts} attempts: {exc}"
+                ) from exc
+            messages.extend(
+                [
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Return either one allowed public-research tool_call or the "
+                            "required final AnalysisResult JSON object. Do not widen the "
+                            f"research request. Validation error: {type(exc).__name__}."
+                        ),
+                    },
+                ]
+            )
 
 
 def _implementation_import_failure_guidance(
@@ -3179,7 +3395,26 @@ def run_developer_pipeline(
         documentation_repair_message: str | None = None
         planning_repair_history: list[dict[str, str]] = []
 
-        if stage_id == "implementation":
+        if stage_id == "analysis":
+            loop_result = _run_analysis_agent_loop(
+                agent=agent,
+                model_profile=model_profile,
+                response_key=response_key,
+                system_prompt=system_prompt,
+                user_message=user_message,
+                max_attempts=max_attempts,
+                call_stage_model=call_stage_model,
+                call_stage_tool=call_stage_tool,
+                trace=trace,
+                store=store,
+            )
+            call_result = loop_result.final_call
+            artifact = loop_result.artifact
+            retry_count = loop_result.retry_count
+            model_call_count = loop_result.model_call_count
+            tool_call_count = loop_result.tool_call_count
+            observed_modes.add(str(call_result.model.get("mode") or ""))
+        elif stage_id == "implementation":
             plan = artifacts.get("implementation_plan")
             if not isinstance(plan, ImplementationPlan):
                 raise DeveloperPipelineError(

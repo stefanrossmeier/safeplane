@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 from harness.notification_schemas import NOTIFICATION_TOOL_SCHEMAS
 from harness.dev_workspace_schemas import DEV_WORKSPACE_TOOL_SCHEMAS
+from harness.web_research_schemas import WEB_RESEARCH_TOOL_SCHEMAS
 
 
 class StrictModel(BaseModel):
@@ -218,6 +219,7 @@ def is_pydantic_validation_error(exc: BaseException) -> bool:
 EXTENSION_TOOL_SCHEMAS: Dict[str, Dict[str, Type[BaseModel]]] = {
     **NOTIFICATION_TOOL_SCHEMAS,
     **DEV_WORKSPACE_TOOL_SCHEMAS,
+    **WEB_RESEARCH_TOOL_SCHEMAS,
 }
 
 _original_validate_tool_input = validate_tool_input

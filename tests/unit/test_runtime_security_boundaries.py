@@ -191,22 +191,34 @@ def test_networks_are_explicit_and_internal_where_required() -> None:
     networks = compose["networks"]
     assert networks["harness-model"]["internal"] is True
     assert networks["harness-tools"]["internal"] is True
+    assert networks["research-gateway"]["internal"] is True
+    assert networks["research-control"]["internal"] is True
     assert networks["notification-delivery"]["internal"] is True
     assert networks["connector-harness"]["internal"] is True
     assert networks["harness-egress"] is None
     assert networks["model-egress"] is None
     assert networks["telegram-egress"] is None
+    assert networks["research-egress"] is None
 
     services = compose["services"]
     assert set(services["harness"]["networks"]) == {
         "harness-egress",
         "harness-model",
         "harness-tools",
+        "research-gateway",
         "connector-harness",
     }
     assert set(services["model-gateway"]["networks"]) == {
         "model-egress",
         "harness-model",
+    }
+    assert set(services["web-research-gateway"]["networks"]) == {
+        "research-gateway",
+        "research-control",
+    }
+    assert set(services["web-research-agent"]["networks"]) == {
+        "research-control",
+        "research-egress",
     }
     assert services["calendar-task-mcp"]["networks"] == ["harness-tools"]
     assert set(services["notification-task-mcp"]["networks"]) == {

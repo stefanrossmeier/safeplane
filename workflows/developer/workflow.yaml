@@ -1,5 +1,5 @@
 workflow_id: developer
-version: 0.9.0
+version: 0.10.0
 description: Complete single-pass Safeplane developer workflow with exact-plan review and harness-owned draft-PR publication.
 supported_entrypoints:
 - developer
@@ -145,8 +145,8 @@ agents:
   analysis:
     prompt:
       id: developer.analysis.system
-      version: v1
-      path: prompts/developer/analysis.system.v1.md
+      version: v2
+      path: prompts/developer/analysis.system.v2.md
     model_profile: developer_analysis
     max_model_attempts: 3
     input_artifacts:
@@ -167,6 +167,9 @@ agents:
         - dev_git_log
         - dev_git_show
         - dev_git_tracked_files
+      web-research:
+        tools:
+        - web_research_clarify
   planning:
     prompt:
       id: developer.planning.system
@@ -388,6 +391,7 @@ workspace:
 mcp:
   servers:
   - dev-workspace
+  - web-research
   - dev-check
   max_tool_call_retries: 5
   allowed_servers:
@@ -407,6 +411,9 @@ mcp:
       - dev_external_skill_list
       - dev_external_skill_read
       - dev_workspace_propose_patch
+    web-research:
+      tools:
+      - web_research_clarify
     dev-check:
       tools:
       - dev_check_run
@@ -428,6 +435,9 @@ mcp:
       - dev_git_show
       - dev_git_tracked_files
       - dev_workspace_propose_patch
+    web-research:
+      tools:
+      - web_research_clarify
 tools:
   enabled: false
   allowed: []

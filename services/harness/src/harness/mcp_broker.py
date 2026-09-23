@@ -263,25 +263,27 @@ class McpToolBroker:
 
             endpoint = str(server["endpoint"])
             tool_call_id = request.tool_call_id or f"tool_call_{uuid.uuid4()}"
+            mcp_params: Dict[str, Any] = {
+                "name": tool_name,
+                "arguments": model_to_dict(validated_input),
+            }
+            if server.get("forward_context", True):
+                mcp_params["context"] = {
+                    "workflow_id": request.workflow_id,
+                    "session_id": request.session_id,
+                    "turn": request.turn,
+                    "run_id": request.run_id,
+                    "connector": request.connector,
+                    "tool_call_id": tool_call_id,
+                    "approval_id": request.approval_id,
+                    "agent_id": request.agent_id,
+                }
 
             mcp_payload = {
                 "jsonrpc": "2.0",
                 "id": tool_call_id,
                 "method": "tools/call",
-                "params": {
-                    "name": tool_name,
-                    "arguments": model_to_dict(validated_input),
-                    "context": {
-                        "workflow_id": request.workflow_id,
-                        "session_id": request.session_id,
-                        "turn": request.turn,
-                        "run_id": request.run_id,
-                        "connector": request.connector,
-                        "tool_call_id": tool_call_id,
-                        "approval_id": request.approval_id,
-                        "agent_id": request.agent_id,
-                    },
-                },
+                "params": mcp_params,
             }
 
             mcp_response = self._post_json(endpoint, mcp_payload)
@@ -561,11 +563,34 @@ class McpToolBroker:
 
         return normalized
 
+    def _endpoint_timeout_seconds(self, endpoint: str) -> float:
+        timeout_seconds = self.timeout_seconds
+        servers = self.config.get("mcp_servers") or {}
+        if not isinstance(servers, dict):
+            return timeout_seconds
+        for server in servers.values():
+            if not isinstance(server, dict) or str(server.get("endpoint") or "") != endpoint:
+                continue
+            configured = server.get("timeout_seconds")
+            if configured is None:
+                return timeout_seconds
+            try:
+                timeout_seconds = float(configured)
+            except (TypeError, ValueError) as exc:
+                raise McpToolExecutionError("MCP server timeout_seconds must be numeric") from exc
+            if timeout_seconds <= 0 or timeout_seconds > 300:
+                raise McpToolExecutionError(
+                    "MCP server timeout_seconds must be > 0 and <= 300"
+                )
+            return timeout_seconds
+        return timeout_seconds
+
     def _post_json(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         encoded = json.dumps(payload).encode("utf-8")
+        timeout_seconds = self._endpoint_timeout_seconds(endpoint)
         if endpoint.startswith("unix://"):
             socket_path = endpoint.removeprefix("unix://")
-            connection = UnixSocketHTTPConnection(socket_path, self.timeout_seconds)
+            connection = UnixSocketHTTPConnection(socket_path, timeout_seconds)
             try:
                 connection.request(
                     "POST",
@@ -592,7 +617,7 @@ class McpToolBroker:
             )
 
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                     body = response.read().decode("utf-8")
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")

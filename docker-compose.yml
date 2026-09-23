@@ -28,6 +28,7 @@ services:
       - harness-egress
       - harness-model
       - harness-tools
+      - research-gateway
       - connector-harness
     read_only: true
     tmpfs:
@@ -87,6 +88,72 @@ services:
     networks:
       - model-egress
       - harness-model
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 128
+    cpus: "1.00"
+    mem_limit: 512m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  web-research-gateway:
+    build: ./services/web-research-gateway
+    image: safeplane-web-research-gateway:latest
+    user: "10001:10001"
+    profiles:
+      - web-research
+    environment:
+      SAFEPLANE_WEB_RESEARCH_UPSTREAM: http://web-research-agent:8080/mcp
+      SAFEPLANE_WEB_RESEARCH_UPSTREAM_TIMEOUT_SECONDS: "115"
+    depends_on:
+      web-research-agent:
+        condition: service_healthy
+    networks:
+      - research-gateway
+      - research-control
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 64
+    cpus: "0.50"
+    mem_limit: 128m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  web-research-agent:
+    build: ./services/web-research-agent
+    image: safeplane-web-research-agent:latest
+    user: "10001:10001"
+    profiles:
+      - web-research
+    environment:
+      SAFEPLANE_WEB_RESEARCH_MODEL: ${SAFEPLANE_WEB_RESEARCH_MODEL:-openai/gpt-5-mini}
+    volumes:
+      - ${SAFEPLANE_WEB_RESEARCH_SECRETS_DIR:-${HOME}/.safeplane/web-research-secrets}:/run/secrets/web-research:ro
+    networks:
+      - research-control
+      - research-egress
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777
@@ -216,6 +283,11 @@ networks:
     internal: true
   harness-tools:
     internal: true
+  research-gateway:
+    internal: true
+  research-control:
+    internal: true
+  research-egress:
   notification-delivery:
     internal: true
   connector-harness:

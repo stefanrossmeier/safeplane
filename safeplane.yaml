@@ -241,6 +241,16 @@ mcp_servers:
         the non-root MCP container sees only /workspace read-only and enforces the
         run-specific root.
 
+  web-research:
+    enabled: true
+    transport: internal_http_jsonrpc
+    endpoint: http://web-research-gateway:8080/mcp
+    forward_context: false
+    timeout_seconds: 120
+    safeplane_enforcement:
+      type: isolated_public_research_boundary
+      description: Internet-enabled research runs in a separate container with no repository or SAFEPLANE_HOME mount; the harness forwards only schema-validated public research arguments and no run/session context.
+
   dev-check:
     enabled: true
     transport: internal_http_jsonrpc
