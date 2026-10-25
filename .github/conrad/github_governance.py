@@ -1,0 +1,204 @@
+"""Trusted-base GitHub PR governance. Never checks out or executes PR code."""
+import base64
+import json
+import os
+from pathlib import PurePosixPath
+import re
+import time
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+
+LABEL = "ai-generated"
+DIRECTORIES = {"repositories", "articles", "papers", "social-posts", "videos", "other"}
+REQUIRED_KEYS = {"schema_version", "type", "title", "source_url", "added", "summary", "tags", "use_cases"}
+
+
+def valid_path(path):
+    parts = PurePosixPath(path).parts
+    return (len(parts) == 3 and parts[0] == "items" and parts[1] in DIRECTORIES
+            and re.fullmatch(r"[a-z0-9][a-z0-9-]*\.md", parts[2]) is not None)
+
+
+def validate_files(files):
+    if not files:
+        return False
+    return all(f.get("status") == "added" and not f.get("previous_filename")
+               and valid_path(f["filename"]) for f in files)
+
+
+def validate_fragment(text):
+    # Structural research-fragment check; no YAML constructors or code execution.
+    if not text.startswith("---\n") or "\n---\n" not in text[4:]:
+        return False
+    front, body = text[4:].split("\n---\n", 1)
+    keys = set(re.findall(r"^([a-z_]+):", front, re.M))
+    return (REQUIRED_KEYS <= keys and bool(body.strip()) and
+            all(h in body for h in ("## What it is", "## Why it is interesting", "## Practical applications")))
+
+
+class GitHub:
+    def __init__(self, repo, token):
+        self.repo = repo
+        self.token = token
+
+    def api(self, path, method="GET", data=None):
+        req = Request("https://api.github.com/repos/" + self.repo + path,
+                      data=None if data is None else json.dumps(data).encode(), method=method,
+                      headers={"Authorization": "Bearer " + self.token,
+                               "Accept": "application/vnd.github+json",
+                               "X-GitHub-Api-Version": "2022-11-28"})
+        with urlopen(req, timeout=30) as response:
+            content = response.read()
+            return json.loads(content) if content else None
+
+    def pages(self, path):
+        output = []
+        for page in range(1, 101):
+            rows = self.api(path + ("&" if "?" in path else "?") + f"per_page=100&page={page}")
+            output.extend(rows)
+            if len(rows) < 100:
+                return output
+        raise RuntimeError("Pagination limit exceeded; refusing partial results")
+
+    def status(self, sha, context, passed, description):
+        self.api("/statuses/" + sha, "POST", {
+            "state": "success" if passed else "failure", "context": context,
+            "description": description[:140],
+            "target_url": os.environ.get("RUN_URL", "https://github.com/" + self.repo)})
+
+
+def candidate(pr):
+    return (pr["head"]["ref"].startswith(("conrad/", "codex/")) or
+            "AI disclosure:" in (pr.get("body") or "") or
+            LABEL in {label["name"] for label in pr["labels"]})
+
+
+def own_fragment_pr(repo, pr):
+    return (repo == "stefanrossmeier/interesting-items" and
+            pr["user"]["login"] == "stefanrossmeier" and
+            pr["head"]["repo"] is not None and pr["head"]["repo"]["full_name"] == repo and
+            pr["head"]["ref"].startswith("conrad/interesting-item-") and
+            pr["base"]["ref"] == "main" and not pr["draft"])
+
+
+def inspect_fragments(gh, pr):
+    files = gh.pages(f'/pulls/{pr["number"]}/files')
+    if len(files) != pr["changed_files"] or len(files) >= 3000 or not validate_files(files):
+        return False
+    # Verify immutable trees as well as the PR diff, including regular file mode.
+    trees = {}
+    def tree(sha):
+        if sha not in trees:
+            trees[sha] = {row["path"]: row for row in gh.api("/git/trees/" + sha)["tree"]}
+        return trees[sha]
+    def find(sha, path):
+        parts = path.split("/")
+        for index, part in enumerate(parts):
+            entry = tree(sha).get(part)
+            if entry is None:
+                return None
+            if index < len(parts) - 1 and entry["type"] != "tree":
+                return None
+            sha = entry["sha"]
+        return entry
+    for f in files:
+        path = f["filename"]
+        entry = find(pr["head"]["sha"], path)
+        if find(pr["base"]["sha"], path) is not None:
+            return False
+        if not entry or entry["type"] != "blob" or entry["mode"] != "100644":
+            return False
+        blob = gh.api("/git/blobs/" + entry["sha"])
+        if blob["size"] > 100000 or blob.get("encoding") != "base64":
+            return False
+        try:
+            text = base64.b64decode(blob["content"]).decode("utf-8")
+        except (ValueError, UnicodeError):
+            return False
+        if not validate_fragment(text):
+            return False
+    return True
+
+
+def checks_ready(gh, pr):
+    sha = pr["head"]["sha"]
+    # All latest commit statuses and latest check runs must succeed. Ignore only
+    # this orchestrator (its pull_request_target run completes after this step).
+    statuses = gh.api("/commits/" + sha + "/status?per_page=100")
+    if statuses.get("total_count", len(statuses["statuses"])) > 100:
+        return False
+    if any(s["state"] != "success" for s in statuses["statuses"]):
+        return False
+    checks = gh.api("/commits/" + sha + "/check-runs?filter=latest&per_page=100")
+    if checks["total_count"] > 100:
+        return False
+    for check in checks["check_runs"]:
+        if check["name"] == "Conrad governance":
+            continue
+        if check["status"] != "completed" or check["conclusion"] not in ("success", "neutral", "skipped"):
+            return False
+    # Existing required checks, including missing ones, are independently enforced
+    # by GitHub's normal merge API. No admin bypass or protection changes occur.
+    return True
+
+
+def process(gh, number, merge_enabled):
+    pr = gh.api(f"/pulls/{number}")
+    if pr["state"] != "open" or not candidate(pr):
+        return
+    gh.api(f"/issues/{number}/labels", "POST", {"labels": [LABEL]})
+    pr = gh.api(f"/pulls/{number}")
+    sha = pr["head"]["sha"]
+    has_label = LABEL in {x["name"] for x in pr["labels"]}
+    gh.status(sha, "conrad/ai-label", has_label, "AI provenance label present")
+    if gh.repo != "stefanrossmeier/interesting-items":
+        print(f"PR #{number}: labeled; human review required")
+        return
+    valid = inspect_fragments(gh, pr)
+    gh.status(sha, "conrad/add-only", valid, "Only new regular Markdown research fragments" if valid else "Not add-only research fragments: manual review required")
+    if not (valid and has_label and merge_enabled and own_fragment_pr(gh.repo, pr)):
+        print(f"PR #{number}: left open (manual review or automation disabled)")
+        return
+    # Refuse merging a PR behind the current default branch. This closes the gap
+    # between validating the base tree and merging while other fragments arrive.
+    base_sha = gh.api("/git/ref/heads/" + pr["base"]["ref"])["object"]["sha"]
+    if base_sha != pr["base"]["sha"]:
+        return
+    comparison = gh.api("/compare/" + base_sha + "..." + sha)
+    if comparison["merge_base_commit"]["sha"] != base_sha:
+        print("Branch must be updated with current main before auto-merge")
+        return
+    if not checks_ready(gh, pr):
+        print("Waiting for checks; scheduled reconciliation will retry")
+        return
+    latest = gh.api(f"/pulls/{number}")
+    if (latest["head"]["sha"] != sha or latest["base"]["sha"] != base_sha or
+        latest["state"] != "open" or latest["draft"] or
+        LABEL not in {x["name"] for x in latest["labels"]}):
+        return
+    # SHA-conditional REST merge: never auto-merge setup/configuration PRs.
+    result = gh.api(f"/pulls/{number}/merge", "PUT", {"sha": sha, "merge_method": "squash"})
+    print(f'PR #{number}: merged={result.get("merged", False)}')
+    if result.get("merged"):
+        ref = latest["head"]["ref"]
+        if ref.startswith("conrad/interesting-item-"):
+            try:
+                gh.api("/git/refs/heads/" + ref, "DELETE")
+            except HTTPError as error:
+                if error.code not in (404, 422):
+                    raise
+
+
+def main():
+    gh = GitHub(os.environ["GITHUB_REPOSITORY"], os.environ["GH_TOKEN"])
+    event = json.load(open(os.environ["GITHUB_EVENT_PATH"]))
+    enabled = os.environ.get("MERGE_ENABLED") == "true"
+    if "pull_request" in event:
+        process(gh, event["pull_request"]["number"], enabled)
+    else:
+        for pr in gh.pages("/pulls?state=open"):
+            process(gh, pr["number"], enabled)
+
+
+if __name__ == "__main__":
+    main()
