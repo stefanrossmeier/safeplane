@@ -1,15 +1,11 @@
 import base64
 import copy
-import importlib.util
-import json
-from pathlib import Path
-import tempfile
 import unittest
-from unittest.mock import patch
+from pathlib import Path
 
 import github_governance as g
 
-FRAGMENT = '''---
+FRAGMENT = """---
 schema_version: 1
 type: article
 title: Test
@@ -25,16 +21,28 @@ Research fragment.
 Useful.
 ## Practical applications
 Research.
-'''
+"""
 
 
 class FakeGitHub:
     repo = "stefanrossmeier/interesting-items"
+
     def __init__(self):
-        self.pr = {"number": 7, "state": "open", "draft": False,
-                   "user": {"login": "stefanrossmeier"}, "body": "AI disclosure: Conrad",
-                   "head": {"sha": "head", "ref": "conrad/interesting-item-test", "repo": {"full_name": self.repo}},
-                   "base": {"sha": "base", "ref": "main"}, "labels": [], "changed_files": 1}
+        self.pr = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "user": {"login": "stefanrossmeier"},
+            "body": "AI disclosure: Conrad",
+            "head": {
+                "sha": "head",
+                "ref": "conrad/interesting-item-test",
+                "repo": {"full_name": self.repo},
+            },
+            "base": {"sha": "base", "ref": "main"},
+            "labels": [],
+            "changed_files": 1,
+        }
         self.files = [{"status": "added", "filename": "items/articles/test.md"}]
         self.statuses = []
         self.mode = "100644"
@@ -65,14 +73,20 @@ class FakeGitHub:
         if path.startswith("/git/trees/"):
             sha = path.rsplit("/", 1)[1]
             trees = {
-                "base": [] if not self.existing else [{"path": "items", "type": "tree", "sha": "items"}],
+                "base": []
+                if not self.existing
+                else [{"path": "items", "type": "tree", "sha": "items"}],
                 "head": [{"path": "items", "type": "tree", "sha": "items"}],
                 "items": [{"path": "articles", "type": "tree", "sha": "articles"}],
                 "articles": [{"path": "test.md", "type": "blob", "sha": "blob", "mode": self.mode}],
             }
             return {"tree": trees[sha]}
         if path == "/git/blobs/blob":
-            return {"content": base64.b64encode(self.content.encode()).decode(), "size": len(self.content), "encoding": "base64"}
+            return {
+                "content": base64.b64encode(self.content.encode()).decode(),
+                "size": len(self.content),
+                "encoding": "base64",
+            }
         if path == "/git/ref/heads/main":
             return {"object": {"sha": "base" if self.base_current else "newbase"}}
         if path == "/compare/base...head":
@@ -107,12 +121,14 @@ class GovernanceTests(unittest.TestCase):
         self.assertEqual(gh.pr["labels"], [{"name": "ai-generated"}])
 
     def test_disallowed_changes(self):
-        for status, filename in [("modified", "items/articles/test.md"),
-                                 ("removed", "items/articles/test.md"),
-                                 ("renamed", "items/articles/test.md"),
-                                 ("added", ".github/workflows/test.md"),
-                                 ("added", "items/articles/test.py"),
-                                 ("added", "items/articles/nested/test.md")]:
+        for status, filename in [
+            ("modified", "items/articles/test.md"),
+            ("removed", "items/articles/test.md"),
+            ("renamed", "items/articles/test.md"),
+            ("added", ".github/workflows/test.md"),
+            ("added", "items/articles/test.py"),
+            ("added", "items/articles/nested/test.md"),
+        ]:
             with self.subTest(status=status, filename=filename):
                 gh = FakeGitHub()
                 gh.files = [{"status": status, "filename": filename}]
@@ -121,8 +137,12 @@ class GovernanceTests(unittest.TestCase):
                 self.assertEqual(gh.statuses[-1]["state"], "failure")
 
     def test_regular_new_research_content_only(self):
-        for attr, value in [("mode", "120000"), ("mode", "100755"),
-                            ("existing", True), ("content", "arbitrary markdown")]:
+        for attr, value in [
+            ("mode", "120000"),
+            ("mode", "100755"),
+            ("existing", True),
+            ("content", "arbitrary markdown"),
+        ]:
             with self.subTest(attr=attr, value=value):
                 gh = FakeGitHub()
                 setattr(gh, attr, value)
@@ -177,7 +197,6 @@ class GovernanceTests(unittest.TestCase):
         gh.pr["body"] = "Ordinary PR"
         g.process(gh, 7, True)
         self.assertEqual(gh.pr["labels"], [])
-
 
 
 if __name__ == "__main__":
